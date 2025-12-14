@@ -17,6 +17,7 @@ from AdvancedCache import AdvancedCache
 from RequestDeduplicator import RequestDeduplicator
 from LoadBalancer import LoadBalancer
 from SearchHelper import SearchHelper
+from LastFM import LastFMClient
 
 app = FastAPI(title="HanyaMusic Music Streaming API", version="3.0.0")
 
@@ -65,6 +66,7 @@ video_cache = AdvancedCache(max_size=800, ttl_minutes=45)
 # REQUEST DEDUPLICATION SYSTEM
 request_deduplicator = RequestDeduplicator()
 load_balancer = LoadBalancer()
+lastfm_client = LastFMClient()
 
 def create_cache_key(func_name: str, *args, **kwargs) -> str:
     """Create a consistent cache key"""
@@ -315,7 +317,19 @@ async def get_video_stream(video_id: str):
         raise
     except Exception as e:
         print(f"[VIDEO] Error: {e}")
+    except Exception as e:
+        print(f"[VIDEO] Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get video stream")
+
+@app.get("/top-artists")
+async def get_top_artists(limit: int = 100):
+    """Get global top artists from Last.fm"""
+    try:
+        artists = lastfm_client.get_global_top_artists(limit=limit)
+        return artists
+    except Exception as e:
+        print(f"[LASTFM] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch top artists")
 
 @app.get("/health")
 async def health_check():
