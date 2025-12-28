@@ -369,6 +369,66 @@ def get_artists_songs(artist_name: str):
         "albums": albums_dict
     }
 
+# https://gist.github.com/daFish/5990634 refer this 
+@app.get("/topglobalartists")
+def top_global_artists(limit: int = 100):
+    """
+    Return today's top global artists from iTunes.
+    Optional query parameter 'limit' to fetch fewer than 100 artists.
+    """
+    artists = itunes_client.get_top_global_artists(limit=limit)
+
+    if not artists:
+        raise HTTPException(
+            status_code=404,
+            detail="Unable to fetch top global artists."
+        )
+
+    return {
+        "total_artists": len(artists),
+        "artists": artists
+    }
+
+@app.get("/topglobalsongs")
+def top_global_songs(limit: int = 100):
+    """
+    Return today's top global songs from iTunes.
+    Optional query parameter 'limit' to fetch fewer than 100 songs.
+    """
+    songs = itunes_client.get_top_global_songs(limit=limit)
+
+    if not songs:
+        raise HTTPException(
+            status_code=404,
+            detail="Unable to fetch top global songs."
+        )
+
+    return {
+        "total_songs": len(songs),
+        "songs": songs
+    }
+
+@app.get("/topcountrysongs/{country_code}")
+def top_country_songs(country_code: str, limit: int = 100):
+    """
+    Return today's top songs for a specific country.
+    :param country_code: Country code (e.g., 'us', 'gb', 'jp')
+    :param limit: Number of songs to fetch (max 200)
+    """
+    songs = itunes_client.get_top_country_songs(country_code=country_code, limit=limit)
+
+    if not songs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unable to fetch top songs for country '{country_code}'."
+        )
+
+    return {
+        "country": country_code,
+        "total_songs": len(songs),
+        "songs": songs
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint with performance metrics"""
