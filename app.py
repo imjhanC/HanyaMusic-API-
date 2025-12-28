@@ -339,7 +339,7 @@ def get_artists_songs(artist_name: str):
     Return all songs by an artist, aligned with their albums,
     including release date, month, year, and thumbnail.
     """
-    songs = itunes.get_all_official_songs_by_artist(artist_name)
+    songs = itunes_client.get_all_official_songs_by_artist(artist_name)
 
     if not songs:
         raise HTTPException(
