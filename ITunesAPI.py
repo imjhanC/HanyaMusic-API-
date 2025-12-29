@@ -2,9 +2,9 @@ import requests
 from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import random
 
 class ITunes:
-    ## Here is the get artist's songs by date released, song preview , thumbnail and sort by date 
     BASE_URL = "https://itunes.apple.com"
 
     def __init__(self, country: str = "US", timeout: int = 10):
@@ -92,6 +92,55 @@ class ITunes:
         all_songs.sort(key=lambda x: x["release_date"], reverse=True)
         return all_songs
     
+    def get_artist_songs_with_sample_thumbnails(self, artist_name: str) -> Dict:
+        """
+        Get all songs by an artist with additional sample thumbnail URLs for 3 random songs
+        """
+        all_songs = self.get_all_official_songs_by_artist(artist_name)
+        
+        if not all_songs:
+            return {
+                "artist": artist_name,
+                "total_songs": 0,
+                "albums": {},
+                "sample_thumbnails": []
+            }
+        
+        # Group songs by album
+        albums_dict = {}
+        for song in all_songs:
+            album = song["album_name"]
+            song_info = {
+                "song_name": song["song_name"],
+                "release_date": song["release_date"],
+                "release_month": song["release_month"],
+                "release_year": song["release_year"],
+                "thumbnail": song.get("thumbnail"),
+                "preview_url": song.get("preview_url"),
+            }
+            if album not in albums_dict:
+                albums_dict[album] = []
+            albums_dict[album].append(song_info)
+        
+        # Select 3 random songs for sample thumbnails
+        sample_thumbnails = []
+        if len(all_songs) >= 3:
+            random_songs = random.sample(all_songs, 3)
+            for song in random_songs:
+                sample_thumbnails.append(song["thumbnail"])
+        else:
+            # If fewer than 3 songs, use all available
+            for song in all_songs:
+                sample_thumbnails.append(song["thumbnail"])
+        
+        return {
+            "artist": artist_name,
+            "total_songs": len(all_songs),
+            "total_albums": len(albums_dict),
+            "albums": albums_dict,
+            "sample_thumbnails": sample_thumbnails
+        }
+    
     ## Get all top global artists 
     def get_top_global_artists(self, limit: int = 100) -> List[Dict]:
         """
@@ -133,7 +182,6 @@ class ITunes:
             artists.append({
                 "rank": len(artists) + 1,
                 "artist_name": name,
-                 #"artist_link": artist_link,
                 "thumbnail": thumbnail
             })
 
@@ -141,6 +189,35 @@ class ITunes:
                 break
 
         return artists
+    
+    def get_top_global_artists_with_thumbnails(self, limit: int = 100) -> Dict:
+        """
+        Get top global artists with sample thumbnail URLs for 5 random artists
+        """
+        artists = self.get_top_global_artists(limit=limit)
+        
+        if not artists:
+            return {
+                "total_artists": 0,
+                "artists": [],
+                "sample_thumbnails": []
+            }
+        
+        # Extract thumbnail URLs from all artists (filter out None)
+        all_thumbnails = [artist["thumbnail"] for artist in artists if artist["thumbnail"]]
+        
+        # Select 3 random thumbnails
+        sample_thumbnails = []
+        if len(all_thumbnails) >= 3:
+            sample_thumbnails = random.sample(all_thumbnails,3)
+        else:
+            sample_thumbnails = all_thumbnails
+        
+        return {
+            "total_artists": len(artists),
+            "artists": artists,
+            "sample_thumbnails": sample_thumbnails
+        }
     
     ## Get all top global songs 
     def get_top_global_songs(self, limit: int = 200) -> List[Dict]:
@@ -186,13 +263,40 @@ class ITunes:
                 "rank": idx,
                 "song_name": song_name,
                 "artist_name": artist_name,
-                #"artist_link": artist_link,
-                #"song_link": song_link,
                 "thumbnail": thumbnail,
                 "preview_url": preview_url
             })
 
         return songs
+    
+    def get_top_global_songs_with_thumbnails(self, limit: int = 100) -> Dict:
+        """
+        Get top global songs with sample thumbnail URLs for 5 random songs
+        """
+        songs = self.get_top_global_songs(limit=limit)
+        
+        if not songs:
+            return {
+                "total_songs": 0,
+                "songs": [],
+                "sample_thumbnails": []
+            }
+        
+        # Extract thumbnail URLs from all songs (filter out None)
+        all_thumbnails = [song["thumbnail"] for song in songs if song["thumbnail"]]
+        
+        # Select 5 random thumbnails
+        sample_thumbnails = []
+        if len(all_thumbnails) >= 3:
+            sample_thumbnails = random.sample(all_thumbnails, 3)
+        else:
+            sample_thumbnails = all_thumbnails
+        
+        return {
+            "total_songs": len(songs),
+            "songs": songs,
+            "sample_thumbnails": sample_thumbnails
+        }
 
     ## Get top country songs by country code
     def get_top_country_songs(self, country_code: str = "us", limit: int = 100) -> List[Dict]:
@@ -243,10 +347,39 @@ class ITunes:
                 "rank": idx,
                 "song_name": song_name,
                 "artist_name": artist_name,
-                #"artist_link": artist_link,
-                #"song_link": song_link,
                 "thumbnail": thumbnail,
                 "preview_url": preview_url
             })
 
         return songs
+    
+    def get_top_country_songs_with_thumbnails(self, country_code: str = "us", limit: int = 100) -> Dict:
+        """
+        Get top country songs with sample thumbnail URLs for 5 random songs
+        """
+        songs = self.get_top_country_songs(country_code=country_code, limit=limit)
+        
+        if not songs:
+            return {
+                "country": country_code,
+                "total_songs": 0,
+                "songs": [],
+                "sample_thumbnails": []
+            }
+        
+        # Extract thumbnail URLs from all songs (filter out None)
+        all_thumbnails = [song["thumbnail"] for song in songs if song["thumbnail"]]
+        
+        # Select 5 random thumbnails
+        sample_thumbnails = []
+        if len(all_thumbnails) >= 3:
+            sample_thumbnails = random.sample(all_thumbnails, 3)
+        else:
+            sample_thumbnails = all_thumbnails
+        
+        return {
+            "country": country_code,
+            "total_songs": len(songs),
+            "songs": songs,
+            "sample_thumbnails": sample_thumbnails
+        }
