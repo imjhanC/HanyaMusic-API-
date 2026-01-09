@@ -18,6 +18,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 # Importing other classes
 from AdvancedCache import AdvancedCache
+from RedisCache import RedisCache
 from RequestDeduplicator import RequestDeduplicator
 from LoadBalancer import LoadBalancer
 from SearchHelper import SearchHelper
@@ -68,9 +69,11 @@ class VideoStreamResponse(BaseModel):
     cached: Optional[bool] = False
 
 # Global caches for each endpoint
-search_cache = AdvancedCache(max_size=500, ttl_minutes=15)
-audio_cache = AdvancedCache(max_size=1000, ttl_minutes=60)
-video_cache = AdvancedCache(max_size=800, ttl_minutes=45)
+# Global caches - Now using REDIS for persistence and shared state
+# We use different prefixes to namespace the keys
+search_cache = RedisCache(prefix="hanya:search:")
+audio_cache = RedisCache(prefix="hanya:audio:")
+video_cache = RedisCache(prefix="hanya:video:")
 
 # REQUEST DEDUPLICATION SYSTEM
 request_deduplicator = RequestDeduplicator()
@@ -150,13 +153,10 @@ async def periodic_cache_cleanup():
     while True:
         await asyncio.sleep(300)
         try:
-            print("[CACHE] Running periodic cleanup...")
-            search_cache._cleanup_expired()
-            audio_cache._cleanup_expired()
-            video_cache._cleanup_expired()
+            print("[CACHE] Redis handles expiration automatically")
             
             gc.collect()
-            print("[CACHE] Cleanup completed")
+            print("[GC] Garbage collection completed")
         except Exception as e:
             print(f"[CACHE] Cleanup error: {e}")
 
@@ -214,7 +214,7 @@ async def cached_search(q: str, limit: Optional[int] = None) -> Tuple[List[Searc
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(executor, SearchHelper.perform_search, q.strip(), limit)
         
-        search_cache.set(cache_key, results)
+        search_cache.set(cache_key, results, ttl_minutes=15)
         return results
     
     results = await request_deduplicator.get_or_execute(cache_key, execute_search)
@@ -237,7 +237,7 @@ async def cached_audio_stream(video_id: str) -> Tuple[StreamResponse, bool]:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(executor, SearchHelper.get_audio_stream_url, video_id)
         
-        audio_cache.set(cache_key, result)
+        audio_cache.set(cache_key, result, ttl_minutes=60)
         return result
     
     result = await request_deduplicator.get_or_execute(cache_key, execute_audio_stream)
@@ -261,7 +261,7 @@ async def cached_video_stream(video_id: str) -> Tuple[VideoStreamResponse, bool]
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(executor, SearchHelper.get_video_stream_url, video_id)
         
-        video_cache.set(cache_key, result)
+        video_cache.set(cache_key, result, ttl_minutes=45)
         return result
     
     result = await request_deduplicator.get_or_execute(cache_key, execute_video_stream)
@@ -488,21 +488,18 @@ async def cache_statistics(request: Request):
     return {
         "search_cache": {
             **search_cache.stats(),
-            "entries": len(search_cache.cache),
             "ttl_minutes": 15
         },
         "audio_cache": {
             **audio_cache.stats(),
-            "entries": len(audio_cache.cache),
             "ttl_minutes": 60,
             "format": "MP3 ONLY"
         },
         "video_cache": {
             **video_cache.stats(),
-            "entries": len(video_cache.cache),
             "ttl_minutes": 45
         },
-        "total_cached_items": len(search_cache.cache) + len(audio_cache.cache) + len(video_cache.cache)
+        "total_cached_items": "Managed by Redis"
     }
 
 @app.get("/performance/realtime")
