@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -11,6 +11,10 @@ from datetime import datetime
 import gc
 import subprocess 
 from datetime import datetime, time
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 # Importing other classes
 from AdvancedCache import AdvancedCache
@@ -20,9 +24,13 @@ from SearchHelper import SearchHelper
 from LastFM import LastFMClient
 from ITunesAPI import ITunes
 
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app = FastAPI(title="HanyaMusic Music Streaming API", version="3.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Enable CORS for React Native
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -170,7 +178,7 @@ async def shutdown_event():
     await cleanup_executors()
 
 @app.get("/")
-async def root():
+async def root(request: Request):
     return {
         "message": "Ultra High-Performance Music Streaming API with MP3-Only Audio!",
         "performance": {
@@ -262,6 +270,7 @@ async def cached_video_stream(video_id: str) -> Tuple[VideoStreamResponse, bool]
 
 @app.get("/search", response_model=List[SearchResult])
 async def search_music(
+    request: Request,
     q: str = Query(..., description="Search query for music"),
     limit: Optional[int] = Query(None, description="Limit number of results (unlimited by default)")
 ):
@@ -284,7 +293,7 @@ async def search_music(
         raise HTTPException(status_code=500, detail="Search failed")
 
 @app.get("/stream/{video_id}", response_model=StreamResponse)
-async def get_stream(video_id: str):
+async def get_stream(request: Request, video_id: str):
     """Get MP3 audio streaming URL - GUARANTEED MP3 FORMAT ONLY"""
     if not video_id:
         raise HTTPException(status_code=400, detail="Video ID is required")
@@ -303,7 +312,7 @@ async def get_stream(video_id: str):
         raise HTTPException(status_code=500, detail="Failed to get MP3 audio stream")
 
 @app.get("/streamvideo/{video_id}", response_model=VideoStreamResponse)
-async def get_video_stream(video_id: str):
+async def get_video_stream(request: Request, video_id: str):
     """Get highest quality video streaming URL - OPTIMIZED with caching, deduplication, and load balancing"""
     if not video_id:
         raise HTTPException(status_code=400, detail="Video ID is required")
@@ -324,7 +333,7 @@ async def get_video_stream(video_id: str):
         raise HTTPException(status_code=500, detail="Failed to get video stream")
 
 @app.get("/top-artists")
-async def get_top_artists(limit: int = 100):
+async def get_top_artists(request: Request, limit: int = 100):
     """Get global top artists from Last.fm"""
     try:
         artists = lastfm_client.get_global_top_artists(limit=limit)
@@ -334,7 +343,7 @@ async def get_top_artists(limit: int = 100):
         raise HTTPException(status_code=500, detail="Failed to fetch top artists")
 
 @app.get("/getartistssongs/{artist_name}")
-def get_artists_songs(artist_name: str):
+def get_artists_songs(request: Request, artist_name: str):
     """
     Return all songs by an artist, aligned with their albums,
     including release date, month, year, thumbnail, and sample thumbnails.
@@ -351,7 +360,7 @@ def get_artists_songs(artist_name: str):
 
 # https://gist.github.com/daFish/5990634 refer this 
 @app.get("/topglobalartists")
-def top_global_artists(limit: int = 100):
+def top_global_artists(request: Request, limit: int = 100):
     result = itunes_client.get_top_global_artists_with_thumbnails(limit=limit)
     
     if not result["artists"]:
@@ -363,7 +372,7 @@ def top_global_artists(limit: int = 100):
     return result
 
 @app.get("/topglobalsongs")
-def top_global_songs(limit: int = 100):
+def top_global_songs(request: Request, limit: int = 100):
     result = itunes_client.get_top_global_songs_with_thumbnails(limit=limit)
     
     if not result["songs"]:
@@ -375,7 +384,7 @@ def top_global_songs(limit: int = 100):
     return result
 
 @app.get("/topcountrysongs/{country_code}")
-def top_country_songs(country_code: str, limit: int = 100):
+def top_country_songs(request: Request, country_code: str, limit: int = 100):
     result = itunes_client.get_top_country_songs_with_thumbnails(country_code=country_code, limit=limit)
     
     if not result["songs"]:
@@ -387,7 +396,7 @@ def top_country_songs(country_code: str, limit: int = 100):
     return result
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint with performance metrics"""
     return {
         "status": "healthy", 
@@ -407,7 +416,7 @@ async def health_check():
     }
 
 @app.get("/stats")
-async def performance_stats():
+async def performance_stats(request: Request):
     """Get current performance statistics and metrics"""
     active_threads = {
         "search": sum(len(e._threads) if e._threads else 0 for e in search_executors),
@@ -462,7 +471,7 @@ async def performance_stats():
     }
 
 @app.post("/cache/clear")
-async def clear_cache():
+async def clear_cache(request: Request):
     """Clear all caches (admin endpoint)"""
     search_cache.clear()
     audio_cache.clear()
@@ -474,7 +483,7 @@ async def clear_cache():
     }
 
 @app.get("/cache/stats")
-async def cache_statistics():
+async def cache_statistics(request: Request):
     """Get detailed cache statistics"""
     return {
         "search_cache": {
@@ -497,7 +506,7 @@ async def cache_statistics():
     }
 
 @app.get("/performance/realtime")
-async def realtime_performance():
+async def realtime_performance(request: Request):
     """Get real-time performance metrics"""
     return {
         "timestamp": datetime.now().isoformat(),
@@ -536,7 +545,7 @@ async def realtime_performance():
     }
 
 @app.get("/format/info")
-async def format_info():
+async def format_info(request: Request):
     """Get information about supported audio formats"""
     return {
         "audio_streaming": {
