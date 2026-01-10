@@ -65,18 +65,24 @@ class ITunes:
             for t in tracks_data.get("results", []):
                 if t.get("wrapperType") == "track" and t.get("artistId") == artist_id:
                     release_iso = t.get("releaseDate")
-                    release_dt = datetime.fromisoformat(release_iso.replace("Z", "+00:00"))
-                    tracks.append({
-                        "song_name": t.get("trackName"),
-                        "album_name": album_name,
-                        "release_date": release_iso,
-                        "release_month": release_dt.strftime("%B"),
-                        "release_year": release_dt.year,
-                        "preview_url": t.get("previewUrl"),
-                        "track_number": t.get("trackNumber"),
-                        "track_id": t.get("trackId"),
-                        "thumbnail": t.get("artworkUrl100").replace("100x100bb", "600x600bb")
-                    })
+                    if release_iso:
+                        release_dt = datetime.fromisoformat(release_iso.replace("Z", "+00:00"))
+                        
+                        thumbnail = t.get("artworkUrl100")
+                        if thumbnail:
+                             thumbnail = thumbnail.replace("100x100bb", "600x600bb")
+                        
+                        tracks.append({
+                            "song_name": t.get("trackName"),
+                            "album_name": album_name,
+                            "release_date": release_iso,
+                            "release_month": release_dt.strftime("%B"),
+                            "release_year": release_dt.year,
+                            "preview_url": t.get("previewUrl"),
+                            "track_number": t.get("trackNumber"),
+                            "track_id": t.get("trackId"),
+                            "thumbnail": thumbnail
+                        })
 
             # Sort tracks newest-first
             tracks.sort(key=lambda x: x["release_date"], reverse=True)
@@ -141,52 +147,54 @@ class ITunes:
             "sample_thumbnails": sample_thumbnails
         }
     
-    ## Get all top global artists 
     def get_top_global_artists(self, limit: int = 100) -> List[Dict]:
         """
         Get top global artists based on top songs feed (deduplicated) with high-res thumbnails.
+        Fetches from multiple countries to ensure enough unique artists.
         """
-        url = f"https://itunes.apple.com/us/rss/topsongs/limit=200/json"  # fetch more to get enough unique artists
-        try:
-            response = requests.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as e:
-            print(f"Request failed: {e}")
-            return []
-
+        countries = ["us", "gb", "jp", "de", "fr", "au", "ca", "it", "es", "br", "mx", "kr", "ru", "nl", "se"]
         seen_artists = set()
         artists = []
 
-        entries = data.get("feed", {}).get("entry", [])
-        for entry in entries:
-            artist_info = entry.get("im:artist", {})
-            name = artist_info.get("label")
-            artist_link = artist_info.get("attributes", {}).get("href")
-            
-            if not name or name in seen_artists:
-                continue
-
-            seen_artists.add(name)
-
-            # thumbnail
-            images = entry.get("im:image", [])
-            thumbnail = None
-            if images:
-                thumbnail = images[-1].get("label", "")
-                if "100x100bb" in thumbnail:
-                    thumbnail = thumbnail.replace("100x100bb", "600x600bb")
-                elif "170x170bb" in thumbnail:
-                    thumbnail = thumbnail.replace("170x170bb", "600x600bb")
-
-            artists.append({
-                "rank": len(artists) + 1,
-                "artist_name": name,
-                "thumbnail": thumbnail
-            })
-
+        for country in countries:
             if len(artists) >= limit:
                 break
+            url = f"https://itunes.apple.com/{country}/rss/topsongs/limit=200/json"
+            try:
+                response = requests.get(url, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
+            except requests.RequestException as e:
+                print(f"Request failed for {country}: {e}")
+                continue
+
+            entries = data.get("feed", {}).get("entry", [])
+            for entry in entries:
+                if len(artists) >= limit:
+                    break
+                artist_info = entry.get("im:artist", {})
+                name = artist_info.get("label")
+                
+                if not name or name in seen_artists:
+                    continue
+
+                seen_artists.add(name)
+
+                # thumbnail
+                images = entry.get("im:image", [])
+                thumbnail = None
+                if images:
+                    thumbnail = images[-1].get("label", "")
+                    if "100x100bb" in thumbnail:
+                        thumbnail = thumbnail.replace("100x100bb", "600x600bb")
+                    elif "170x170bb" in thumbnail:
+                        thumbnail = thumbnail.replace("170x170bb", "600x600bb")
+
+                artists.append({
+                    "rank": len(artists) + 1,
+                    "artist_name": name,
+                    "thumbnail": thumbnail
+                })
 
         return artists
     
