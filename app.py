@@ -292,6 +292,57 @@ async def search_music(
         print(f"[SEARCH] Error: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
+@app.get("/search/exact", response_model=StreamResponse)
+async def search_exact_music(
+    request: Request,
+    song_title: str = Query(..., description="Song title"),
+    artist: str = Query(..., description="Artist name")
+):
+    """
+    Search specifically for ONE best match exact song and return its AUDIO STREAM directly.
+    Requires separate song_title and artist parameters.
+    """
+    if not song_title or len(song_title.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Song title must be at least 2 characters")
+    if not artist or len(artist.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Artist name must be at least 2 characters")
+    
+    try:
+        # Step 1: Find the video ID
+        # Combine song title and artist for search
+        combined_query = f"{song_title} {artist}"
+        enhanced_q = f"{combined_query} official audio"
+        print(f"[SEARCH-EXACT] Processing: '{song_title}' by '{artist}' -> '{enhanced_q}'")
+        
+        # Search with limit=1 because we only want the BEST match
+        results, from_cache = await cached_search(enhanced_q, limit=1)
+        
+        if not results:
+            print(f"[SEARCH-EXACT] strict search empty, retrying with just 'audio'")
+            fallback_q = f"{q} audio"
+            results, from_cache = await cached_search(fallback_q, limit=1)
+        
+        if not results:
+             raise HTTPException(status_code=404, detail="No exact match found")
+        
+        best_match = results[0]
+        # database results are dicts internally until FastAPI serializes them
+        video_id = best_match['videoId']
+        print(f"[SEARCH-EXACT] Found best match: {best_match.get('title')} ({video_id})")
+
+        # Step 2: Get the stream for this video ID
+        # We reuse the existing cached_audio_stream function
+        stream_result, stream_from_cache = await cached_audio_stream(video_id)
+        
+        print(f"[SEARCH-EXACT] Retrieved stream for {video_id} {'(cached)' if stream_from_cache else '(fresh)'}")
+        return stream_result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SEARCH-EXACT] Error: {e}")
+        raise HTTPException(status_code=500, detail="Exact search failed")
+
 @app.get("/stream/{video_id}", response_model=StreamResponse)
 async def get_stream(request: Request, video_id: str):
     """Get MP3 audio streaming URL - GUARANTEED MP3 FORMAT ONLY"""
