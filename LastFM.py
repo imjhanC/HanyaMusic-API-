@@ -39,3 +39,27 @@ class LastFMClient:
         except requests.RequestException as e:
             print(f"Error fetching data from Last.fm: {e}")
             return []
+    
+    def get_artist_image(self, artist):
+        """
+        Fetch artist image from TheAudioDB API
+        """
+        url = "https://www.theaudiodb.com/api/v1/json/2/search.php" # Using '2' as public key or '123' if requested
+        params = {"s": artist}
+
+        try:
+            r = requests.get(url, params=params, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            
+            artists = data.get("artists")
+            if artists and len(artists) > 0:
+                # Prioritize strArtistThumb, fallback to strArtistFanart
+                artist_data = artists[0]
+                image_url = artist_data.get("strArtistThumb") or artist_data.get("strArtistFanart")
+                return image_url
+            
+        except requests.RequestException as e:
+            print(f"Error fetching artist image from AudioDB for {artist}: {e}")
+            
+        return None

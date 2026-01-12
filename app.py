@@ -409,6 +409,44 @@ def get_artists_songs(request: Request, artist_name: str):
 
     return result
 
+@app.get("/getrelatedartists/{song_name}")
+async def get_related_artists(request: Request, song_name: str):
+    """
+    Get related artists for a song and fetch their images from Last.fm concurrently.
+    """
+    try:
+        # Using a thread pool for the synchronous iTunes call
+        loop = asyncio.get_event_loop()
+        related_artists = await loop.run_in_executor(
+            None, itunes_client.get_top_5_artists_for_song, song_name
+        )
+        
+        if not related_artists:
+            return {"song": song_name, "related_artists": []}
+            
+        #Fetch images for all artists concurrently
+        async def fetch_artist_data(artist_name):
+            image = await loop.run_in_executor(
+                None, lastfm_client.get_artist_image, artist_name
+            )
+            return {
+                "artist_name": artist_name,
+                "image": image
+            }
+
+        # Run all image fetches in parallel
+        tasks = [fetch_artist_data(artist) for artist in related_artists]
+        results = await asyncio.gather(*tasks)
+
+        return {
+            "song": song_name,
+            "related_artists": results
+        }
+
+    except Exception as e:
+        print(f"[RELATED-ARTISTS] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch related artists")
+
 # https://gist.github.com/daFish/5990634 refer this 
 @app.get("/topglobalartists")
 def top_global_artists(request: Request, limit: int = 100):

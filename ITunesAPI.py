@@ -52,6 +52,16 @@ class ITunes:
         # Sort albums newest-first
         albums.sort(key=lambda x: x.get("releaseDate", ""), reverse=True)
 
+        # Deduplicate albums by name to reduce redundant track fetches (improves speed)
+        seen_albums = set()
+        deduplicated_albums = []
+        for album in albums:
+            name_key = album.get("collectionName", "").lower().strip()
+            if name_key not in seen_albums:
+                seen_albums.add(name_key)
+                deduplicated_albums.append(album)
+        albums = deduplicated_albums
+
         all_songs = []
 
         def fetch_album_tracks(album):
@@ -100,7 +110,8 @@ class ITunes:
     
     def get_artist_songs_with_sample_thumbnails(self, artist_name: str) -> Dict:
         """
-        Get all songs by an artist with additional sample thumbnail URLs for 3 random songs
+        Get all songs by an artist with additional sample thumbnail URLs for 3 random songs.
+        Deduplicates songs by title to ensure unique results across albums.
         """
         all_songs = self.get_all_official_songs_by_artist(artist_name)
         
@@ -112,12 +123,25 @@ class ITunes:
                 "sample_thumbnails": []
             }
         
-        # Group songs by album
+        # Group songs by album and deduplicate by song name globally for this artist
         albums_dict = {}
+        seen_songs = set()
+        unique_all_songs = []
+        
         for song in all_songs:
+            # Fast title-based deduplication
+            song_title = song["song_name"]
+            title_key = song_title.lower().strip()
+            
+            if title_key in seen_songs:
+                continue
+            
+            seen_songs.add(title_key)
+            unique_all_songs.append(song)
+            
             album = song["album_name"]
             song_info = {
-                "song_name": song["song_name"],
+                "song_name": song_title,
                 "release_date": song["release_date"],
                 "release_month": song["release_month"],
                 "release_year": song["release_year"],
@@ -128,20 +152,20 @@ class ITunes:
                 albums_dict[album] = []
             albums_dict[album].append(song_info)
         
-        # Select 3 random songs for sample thumbnails
+        # Select 3 random unique songs for sample thumbnails
         sample_thumbnails = []
-        if len(all_songs) >= 3:
-            random_songs = random.sample(all_songs, 3)
+        if len(unique_all_songs) >= 3:
+            random_songs = random.sample(unique_all_songs, 3)
             for song in random_songs:
                 sample_thumbnails.append(song["thumbnail"])
         else:
-            # If fewer than 3 songs, use all available
-            for song in all_songs:
+            # If fewer than 3 unique songs, use all available
+            for song in unique_all_songs:
                 sample_thumbnails.append(song["thumbnail"])
         
         return {
             "artist": artist_name,
-            "total_songs": len(all_songs),
+            "total_songs": len(unique_all_songs),
             "total_albums": len(albums_dict),
             "albums": albums_dict,
             "sample_thumbnails": sample_thumbnails
@@ -391,3 +415,33 @@ class ITunes:
             "songs": songs,
             "sample_thumbnails": sample_thumbnails
         }
+
+    ## Get top 5 artists for a song ( Relevance artists )
+    def get_top_5_artists_for_song(self, song):
+        url = "https://itunes.apple.com/search"
+
+        params = {
+            "term": song,
+            "media": "music",
+            "entity": "song",
+            "attribute": "songTerm",   
+            "limit": 20                
+        }
+
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+
+        ranked_artists = []
+        seen = set()
+
+        for item in data["results"]:
+            artist = item["artistName"]
+
+            if artist not in seen:
+                ranked_artists.append(artist)
+                seen.add(artist)
+
+            if len(ranked_artists) == 5:
+                break
+
+        return ranked_artists
