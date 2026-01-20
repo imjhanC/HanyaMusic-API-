@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -15,6 +15,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from sqlalchemy import create_engine, text
+import os
+from dotenv import load_dotenv
+load_dotenv()
+import base64
 
 # Importing other classes
 from AdvancedCache import AdvancedCache
@@ -24,11 +29,23 @@ from LoadBalancer import LoadBalancer
 from SearchHelper import SearchHelper
 from LastFM import LastFMClient
 from ITunesAPI import ITunes
+from SQLconn import get_db, engine
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+import bcrypt as bcrypt_lib
+from fastapi import Depends, status, Security
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from datetime import timedelta
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app = FastAPI(title="HanyaMusic Music Streaming API", version="3.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# For POSTGRESQL connection
+# For POSTGRESQL connection
+# engine imported from SQLconn
 
 # Enable CORS for React Native
 app.add_middleware(SlowAPIMiddleware)
@@ -67,6 +84,91 @@ class VideoStreamResponse(BaseModel):
     quality: str
     stream_type: str
     cached: Optional[bool] = False
+
+class UserRegister(BaseModel):
+    username: str
+    email: str
+    password: str
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    display_name: Optional[str]
+    avatar_url: Optional[str]
+    is_verified: bool
+    is_active: bool
+    role: str
+    last_login: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+
+# Password hashing functions using bcrypt directly
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    # Truncate to 72 bytes for bcrypt compatibility
+    password_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt_lib.gensalt()
+    hashed = bcrypt_lib.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against a hash"""
+    # Truncate to 72 bytes for bcrypt compatibility
+    password_bytes = plain_password.encode('utf-8')[:72]
+    return bcrypt_lib.checkpw(password_bytes, hashed_password.encode('utf-8'))
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# JWT Configuration
+SECRET_KEY = "HANYAMUSIC_SECRET_KEY_PLEASE_CHANGE_IN_PRODUCTION" # TODO: Move to .env
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    
+    user = db.execute(text("SELECT * FROM users WHERE username = :username"), {"username": token_data.username}).fetchone()
+    if user is None:
+        raise credentials_exception
+    return user
 
 # Global caches for each endpoint
 # Global caches - Now using REDIS for persistence and shared state
@@ -267,6 +369,129 @@ async def cached_video_stream(video_id: str) -> Tuple[VideoStreamResponse, bool]
     result = await request_deduplicator.get_or_execute(cache_key, execute_video_stream)
     result['cached'] = False
     return result, False
+
+## Endpoint for registering account 
+@app.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    username: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+    display_name: Optional[str] = Form(None),
+    avatar: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db)
+):
+    """Register a new user with optional avatar image login"""
+    # Validate password length (bcrypt has 72 byte limit)
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if len(password) > 100:
+        raise HTTPException(status_code=400, detail="Password is too long (max 100 characters)")
+    
+    # Check if user exists
+    existing_user = db.execute(text("SELECT id FROM users WHERE username = :username OR email = :email"), 
+                               {"username": username, "email": email}).fetchone()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+    
+    # Hash password
+    hashed_password = hash_password(password)
+
+    # Handle Avatar
+    avatar_url_value = None
+    if avatar:
+        if avatar.content_type not in ["image/jpeg", "image/png", "image/gif", "image/jpg"]:
+             raise HTTPException(status_code=400, detail="Invalid image format")
+        
+        file_content = await avatar.read()
+        encoded_string = base64.b64encode(file_content).decode("utf-8")
+        avatar_url_value = f"data:{avatar.content_type};base64,{encoded_string}"
+    
+    # Insert user
+    try:
+        query = text("""
+            INSERT INTO users (username, email, password_hash, display_name, avatar_url)
+            VALUES (:username, :email, :password_hash, :display_name, :avatar_url)
+            RETURNING id, username, email, created_at
+        """)
+        result = db.execute(query, {
+            "username": username,
+            "email": email,
+            "password_hash": hashed_password,
+            "display_name": display_name,
+            "avatar_url": avatar_url_value
+        })
+        new_user = result.fetchone()
+        db.commit()
+        
+        # Generate Access Token for the new user
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": new_user.username}, expires_delta=access_token_expires
+        )
+        
+        return {
+            "id": new_user.id,
+            "username": new_user.username,
+            "email": new_user.email,
+            "created_at": new_user.created_at,
+            "message": "User registered successfully",
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Login to get access token (checks both username and email)"""
+    # Check if username OR email matches
+    user = db.execute(
+        text("SELECT * FROM users WHERE username = :identifier OR email = :identifier"), 
+        {"identifier": form_data.username}
+    ).fetchone()
+    
+    
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/users/me", response_model=UserResponse)
+async def read_users_me(current_user: UserResponse = Depends(get_current_user)):
+    """Get current logged in user details"""
+    return current_user
+
+@app.get("/users/{user_id}", response_model=UserResponse)
+def get_user_details(user_id: int, current_user: UserResponse = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get user details by ID - Requires Auth"""
+    try:
+        user = db.execute(
+            text("""
+                SELECT id, username, email, display_name, avatar_url, 
+                       is_verified, is_active, role, last_login, 
+                       created_at, updated_at
+                FROM users 
+                WHERE id = :user_id
+            """), 
+            {"user_id": user_id}
+        ).fetchone()
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        return user
+    except Exception as e:
+        print(f"[USER_DETAIL] Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch user details")
 
 @app.get("/search", response_model=List[SearchResult])
 async def search_music(
@@ -591,6 +816,23 @@ async def cache_statistics(request: Request):
         "total_cached_items": "Managed by Redis"
     }
 
+# PostGRESQL test endpoint 
+@app.get("/test-db")
+def test_db():
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1"))
+            return {
+                "status": "success",
+                "message": "FastAPI connected to PostgreSQL!",
+                "result": result.scalar()
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+    
 @app.get("/performance/realtime")
 async def realtime_performance(request: Request):
     """Get real-time performance metrics"""

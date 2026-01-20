@@ -9,3 +9,9 @@ bs4
 asyncio
 slowapi
 redis
+sqlalchemy
+psycopg2-binary
+passlib
+bcrypt
+python-jose[cryptography]
+python-multipart
