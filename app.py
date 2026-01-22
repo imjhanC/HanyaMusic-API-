@@ -544,7 +544,7 @@ async def search_exact_music(
         
         if not results:
             print(f"[SEARCH-EXACT] strict search empty, retrying with just 'audio'")
-            fallback_q = f"{q} audio"
+            fallback_q = f"{combined_query} audio"
             results, from_cache = await cached_search(fallback_q, limit=1)
         
         if not results:
@@ -568,6 +568,74 @@ async def search_exact_music(
         print(f"[SEARCH-EXACT] Error: {e}")
         raise HTTPException(status_code=500, detail="Exact search failed")
 
+@app.get("/search/exactwithMV", response_model=VideoStreamResponse)
+async def search_exact_music_with_mv(
+    request: Request,
+    song_title: str = Query(..., description="Song title"),
+    artist: str = Query(..., description="Artist name")
+):
+    """
+    Search for a music video and return video + audio stream URLs.
+    Prioritizes: official music video -> color coded -> visualizer -> lyrics -> audio with visuals
+    """
+    if not song_title or len(song_title.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Song title must be at least 2 characters")
+    if not artist or len(artist.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Artist name must be at least 2 characters")
+    
+    try:
+        combined_query = f"{song_title} {artist}"
+        
+        # Priority search terms for music videos
+        search_terms = [
+            f"{combined_query} official music video",
+            f"{combined_query} music video",
+            f"{combined_query} mv",
+            f"{combined_query} color coded",
+            f"{combined_query} visualizer",
+            f"{combined_query} lyrics video",
+            f"{combined_query} official video",
+            f"{combined_query} audio"
+        ]
+        
+        video_id = None
+        matched_title = None
+        search_term_used = None
+        
+        # Try each search term until we find a valid video
+        for search_term in search_terms:
+            print(f"[SEARCH-EXACTMV] Trying: '{search_term}'")
+            results, from_cache = await cached_search(search_term, limit=3)
+            
+            if results:
+                # Take the first valid result
+                best_match = results[0]
+                video_id = best_match['videoId']
+                matched_title = best_match.get('title')
+                search_term_used = search_term
+                print(f"[SEARCH-EXACTMV] Found match: {matched_title} ({video_id}) using '{search_term}'")
+                break
+        
+        if not video_id:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No video found for '{song_title}' by '{artist}'"
+            )
+        
+        # Get the video stream for this video ID
+        stream_result, stream_from_cache = await cached_video_stream(video_id)
+        
+        print(f"[SEARCH-EXACTMV] Retrieved video stream for {video_id} {'(cached)' if stream_from_cache else '(fresh)'}")
+        print(f"[SEARCH-EXACTMV] Search term that worked: '{search_term_used}'")
+        
+        return stream_result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SEARCH-EXACTMV] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Exact MV search failed: {str(e)}")
+    
 @app.get("/stream/{video_id}", response_model=StreamResponse)
 async def get_stream(request: Request, video_id: str):
     """Get MP3 audio streaming URL - GUARANTEED MP3 FORMAT ONLY"""
