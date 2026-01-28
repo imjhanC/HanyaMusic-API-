@@ -322,8 +322,8 @@ async def cached_search(q: str, limit: Optional[int] = None) -> Tuple[List[Searc
     results = await request_deduplicator.get_or_execute(cache_key, execute_search)
     return results, False
 
-async def cached_audio_stream(video_id: str) -> Tuple[StreamResponse, bool]:
-    """Audio stream with caching and deduplication - RETURNS MP3 ONLY"""
+async def cached_audio_stream(video_id: str) -> Tuple[Dict, bool]:
+    """Audio stream with caching and deduplication - RETURNS MP3 ONLY with headers"""
     cache_key = create_cache_key("audio_mp3", video_id)
     
     cached_result = audio_cache.get(cache_key)
@@ -338,6 +338,17 @@ async def cached_audio_stream(video_id: str) -> Tuple[StreamResponse, bool]:
         executor = load_balancer.get_least_loaded_executor(audio_executors)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(executor, SearchHelper.get_audio_stream_url, video_id)
+        
+        # Add required headers for client to use
+        result['headers'] = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',
+            'DNT': '1',
+        }
         
         audio_cache.set(cache_key, result, ttl_minutes=60)
         return result

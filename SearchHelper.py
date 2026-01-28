@@ -179,7 +179,7 @@ class SearchHelper:
     
     @classmethod
     def get_audio_stream_url(cls, video_id: str) -> Dict:
-        """Get streaming URL for audio - ENFORCES MP3 FORMAT ONLY"""
+        """Get streaming URL for audio - ENFORCES MP3 FORMAT ONLY with headers"""
         try:
             thread_name = threading.current_thread().name
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -199,7 +199,9 @@ class SearchHelper:
                 'extractor_retries': 1,
                 'fragment_retries': 1,
                 'socket_timeout': 15,
-                'http_headers': cls.get_common_headers()
+                'http_headers': cls.get_common_headers(),
+                # This is IMPORTANT: get the cookies and headers
+                'cookiefile': 'cookies.txt',  # Optional: if you have YouTube cookies
             }
             
             print(f"[{thread_name}] Extracting MP3 audio stream for {video_id}")
@@ -215,6 +217,11 @@ class SearchHelper:
                     elif info.get('tbr'):
                         quality_info = f"{info['tbr']}kbps MP3"
                     
+                    # Get the actual headers yt-dlp used
+                    extracted_headers = info.get('http_headers', {})
+                    if not extracted_headers:
+                        extracted_headers = cls.get_common_headers()
+                    
                     print(f"[{thread_name}] Successfully extracted MP3 audio stream: {quality_info}")
                     return {
                         'stream_url': info['url'],
@@ -222,7 +229,8 @@ class SearchHelper:
                         'duration': info.get('duration', 0),
                         'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
                         'format': 'mp3',
-                        'quality': quality_info
+                        'quality': quality_info,
+                        'headers': extracted_headers  # Include headers
                     }
             
             raise Exception("No MP3 audio stream could be generated")
