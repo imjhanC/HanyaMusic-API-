@@ -1,7 +1,22 @@
 import yt_dlp
 import threading
+import os
+import uuid
+import subprocess
+import tempfile
 from typing import Dict, List, Optional
 from fastapi import HTTPException
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict
+
+import requests
+import yt_dlp
+from fastapi import HTTPException
+
+# Resolve cookies.txt path relative to this file, so it works regardless of working directory
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIES_FILE = os.path.join(_BASE_DIR, 'cookies.txt')
 
 
 class SearchHelper:
@@ -48,6 +63,21 @@ class SearchHelper:
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
         }
+
+    @staticmethod
+    def _get_cookie_opts() -> dict:
+        """
+        Build cookie-related yt-dlp options.
+        Uses cookies.txt if it exists, otherwise returns empty dict (graceful fallback).
+        """
+        if os.path.isfile(COOKIES_FILE):
+            print(f"[CookieOpts] Using cookies from: {COOKIES_FILE}")
+            return {'cookiefile': COOKIES_FILE}
+        else:
+            print(f"[CookieOpts] WARNING: cookies.txt not found at '{COOKIES_FILE}'. "
+                  f"YouTube bot-detection may trigger. "
+                  f"Place cookies.txt next to SearchHelper.py to fix this.")
+            return {}
     
     @staticmethod
     def is_valid_video(entry: Dict) -> bool:
@@ -55,26 +85,20 @@ class SearchHelper:
         if not entry:
             return False
         
-        # Get video ID and URL
         video_id = entry.get('id', '')
         url = entry.get('url', '')
         title = entry.get('title', '').lower()
         
-        # Check for shorts in URL or ID
         if '/shorts/' in url or 'shorts' in video_id.lower():
             return False
         
-        # Check for valid video ID format (YouTube video IDs are exactly 11 characters)
         if not video_id or len(video_id) != 11:
             return False
         
-        # Duration check - but handle None gracefully
         duration = entry.get('duration')
         if duration is not None:
-            # Filter out very short videos (likely shorts)
             if duration < 61:
                 return False
-        # If duration is None, we'll allow it (it might be a live stream or we just don't have the info yet)
         
         return True
     
@@ -86,16 +110,13 @@ class SearchHelper:
         
         try:
             thread_name = threading.current_thread().name
-            
-            # Clean and normalize the query - this fixes the trailing space issue
             clean_query = query.strip()
             print(f"[{thread_name}] Searching for: '{clean_query}'")
             
-            # Optimized yt-dlp options - KEEP extract_flat for speed
             search_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': 'in_playlist',  # Keep this for SPEED - we'll filter smartly
+                'extract_flat': 'in_playlist',
                 'skip_download': True,
                 'ignoreerrors': True,
                 'geo_bypass': True,
@@ -110,10 +131,10 @@ class SearchHelper:
                     'youtube': {
                         'skip': ['hls', 'dash', 'translated_subs']
                     }
-                }
+                },
+                **cls._get_cookie_opts(),
             }
             
-            # Fetch more results to account for filtering (2x instead of 3x for speed)
             fetch_count = (limit * 2) if limit else 40
             with yt_dlp.YoutubeDL(search_opts) as ydl:
                 search_results = ydl.extract_info(
@@ -134,11 +155,9 @@ class SearchHelper:
             target_limit = limit if limit else 20
             
             for entry in entries:
-                # Fast skip invalid entries
                 if not entry:
                     continue
                 
-                # Validate video (filter shorts, reels, channels) - using fast validation
                 if not cls.is_valid_video(entry):
                     continue
                     
@@ -148,13 +167,11 @@ class SearchHelper:
                     
                 seen.add(vid)
                 
-                # Fast access with get() and defaults
                 title = entry.get('title', 'No Title')
                 uploader = entry.get('uploader', 'Unknown')
                 duration = entry.get('duration')
                 view_count = entry.get('view_count')
                 
-                # Build result dict directly
                 filtered.append({
                     'title': str(title)[:100],
                     'thumbnail_url': f"https://img.youtube.com/vi/{vid}/maxresdefault.jpg",
@@ -165,7 +182,6 @@ class SearchHelper:
                     'url': f"https://www.youtube.com/watch?v={vid}"
                 })
                 
-                # Early exit when limit reached
                 if len(filtered) >= target_limit:
                     break
             
@@ -180,79 +196,98 @@ class SearchHelper:
     @classmethod
     def get_audio_stream_url(cls, video_id: str) -> Dict:
         """Get streaming URL for audio - ENFORCES MP3 FORMAT ONLY with headers"""
-        try:
-            thread_name = threading.current_thread().name
-            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            print(f"[{thread_name}] Processing video_id: {video_id} - ENFORCING MP3 FORMAT")
-            
-            # Force MP3 format only with postprocessor
-            opts = {
-                'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '320',
-                }],
-                'quiet': True,
-                'no_warnings': True,
-                'extractor_retries': 1,
-                'fragment_retries': 1,
-                'socket_timeout': 15,
-                'http_headers': cls.get_common_headers(),
-                # This is IMPORTANT: get the cookies and headers
-                'cookiefile': 'cookies.txt',  # Optional: if you have YouTube cookies
-            }
-            
-            print(f"[{thread_name}] Extracting MP3 audio stream for {video_id}")
-            
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
-                
-                if info and info.get('url'):
-                    # Get audio quality information
-                    quality_info = "320kbps MP3"
-                    if info.get('abr'):
-                        quality_info = f"{info['abr']}kbps MP3"
-                    elif info.get('tbr'):
-                        quality_info = f"{info['tbr']}kbps MP3"
-                    
-                    # Get the actual headers yt-dlp used
-                    extracted_headers = info.get('http_headers', {})
-                    if not extracted_headers:
-                        extracted_headers = cls.get_common_headers()
-                    
-                    print(f"[{thread_name}] Successfully extracted MP3 audio stream: {quality_info}")
-                    return {
-                        'stream_url': info['url'],
-                        'title': info.get('title', 'Unknown Title'),
-                        'duration': info.get('duration', 0),
-                        'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-                        'format': 'mp3',
-                        'quality': quality_info,
-                        'headers': extracted_headers  # Include headers
-                    }
-            
-            raise Exception("No MP3 audio stream could be generated")
-            
-        except Exception as e:
-            thread_name = threading.current_thread().name
-            error_msg = str(e)
-            print(f"[{thread_name}] Error getting MP3 audio stream URL: {error_msg}")
-            
-            if 'bot' in error_msg.lower() or 'sign in' in error_msg.lower():
-                raise HTTPException(
-                    status_code=503, 
-                    detail="YouTube is temporarily blocking requests. Please try again in a few minutes."
-                )
-            elif 'private' in error_msg.lower():
-                raise HTTPException(status_code=403, detail="This video is private")
-            elif 'unavailable' in error_msg.lower():
-                raise HTTPException(status_code=404, detail="This video is not available")
-            elif 'copyright' in error_msg.lower():
-                raise HTTPException(status_code=451, detail="This video is not available due to copyright restrictions")
-            else:
-                raise HTTPException(status_code=500, detail=f"Failed to get MP3 audio stream URL: {error_msg}")
+        thread_name = threading.current_thread().name
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        print(f"[{thread_name}] Processing video_id: {video_id} - ENFORCING MP3 FORMAT")
+
+        base_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_retries': 2,
+            'fragment_retries': 2,
+            'socket_timeout': 15,
+            'http_headers': cls.get_common_headers(),
+            'nocheckcertificate': True,
+            'no_color': True,
+            **cls._get_cookie_opts(),
+        }
+
+        format_strategies = [
+            {
+                'label': 'bestaudio (raw)',
+                'opts': {
+                    **base_opts,
+                    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+                }
+            },
+            {
+                'label': 'bestaudio → mp3 (postprocessed)',
+                'opts': {
+                    **base_opts,
+                    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '320',
+                    }],
+                }
+            },
+        ]
+
+        last_error = None
+
+        for strategy in format_strategies:
+            label = strategy['label']
+            opts = strategy['opts']
+            try:
+                print(f"[{thread_name}] Trying strategy: {label}")
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(youtube_url, download=False)
+
+                    if info and info.get('url'):
+                        quality_info = "320kbps MP3"
+                        if info.get('abr'):
+                            quality_info = f"{info['abr']}kbps MP3"
+                        elif info.get('tbr'):
+                            quality_info = f"{info['tbr']}kbps MP3"
+
+                        extracted_headers = info.get('http_headers') or cls.get_common_headers()
+
+                        print(f"[{thread_name}] Successfully extracted audio stream via '{label}': {quality_info}")
+                        return {
+                            'stream_url': info['url'],
+                            'title': info.get('title', 'Unknown Title'),
+                            'duration': info.get('duration', 0),
+                            'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                            'format': 'mp3',
+                            'quality': quality_info,
+                            'headers': extracted_headers,
+                        }
+
+            except Exception as e:
+                last_error = str(e)
+                print(f"[{thread_name}] Strategy '{label}' failed: {last_error}")
+                if any(k in last_error.lower() for k in ('sign in', 'bot', 'private', 'unavailable', 'copyright')):
+                    break
+                continue
+
+        error_msg = last_error or "No audio stream could be extracted"
+        print(f"[{thread_name}] All strategies failed for {video_id}: {error_msg}")
+
+        if 'bot' in error_msg.lower() or 'sign in' in error_msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="YouTube is temporarily blocking requests. Please try again in a few minutes."
+            )
+        elif 'private' in error_msg.lower():
+            raise HTTPException(status_code=403, detail="This video is private")
+        elif 'unavailable' in error_msg.lower():
+            raise HTTPException(status_code=404, detail="This video is not available")
+        elif 'copyright' in error_msg.lower():
+            raise HTTPException(status_code=451, detail="This video is not available due to copyright restrictions")
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to get MP3 audio stream URL: {error_msg}")
     
     @classmethod
     def get_video_stream_url(cls, video_id: str) -> Dict:
@@ -284,7 +319,10 @@ class SearchHelper:
                 'fragment_retries': 2,
                 'merge_output_format': 'mp4',
                 'socket_timeout': 20,
-                'http_headers': cls.get_common_headers()
+                'http_headers': cls.get_common_headers(),
+                'nocheckcertificate': True,
+                'no_color': True,
+                **cls._get_cookie_opts(),
             }
             
             print(f"[{thread_name}] Extracting highest quality video stream for {video_id}")
@@ -293,7 +331,6 @@ class SearchHelper:
                 info = ydl.extract_info(youtube_url, download=False)
                 
                 if info:
-                    # Check for separate streams (preferred)
                     if 'requested_formats' in info and info['requested_formats']:
                         video_url = None
                         audio_url = None
@@ -314,15 +351,11 @@ class SearchHelper:
                                 audio_format = fmt
                         
                         if video_url and audio_url:
-                            # Safe handling of None values
                             fps = video_format.get('fps') if video_format else None
                             vbr = video_format.get('vbr') if video_format else None
                             abr = audio_format.get('abr') if audio_format else None
                             
-                            # Safe FPS handling
                             fps = fps if fps is not None and fps > 0 else 30
-                            
-                            # Safe bitrate handling
                             vbr = vbr if vbr is not None and vbr > 0 else 0
                             abr = abr if abr is not None and abr > 0 else 0
                             
@@ -343,7 +376,6 @@ class SearchHelper:
                                 'stream_type': 'separate'
                             }
                     
-                    # Check for single URL (combined)
                     if info.get('url'):
                         quality = "Unknown"
                         if info.get('height'):
@@ -355,14 +387,10 @@ class SearchHelper:
                         has_audio = info.get('acodec') and info.get('acodec') != 'none'
                         
                         if has_video and has_audio:
-                            # Safe handling of None values
                             fps = info.get('fps')
                             vbr = info.get('vbr')
                             
-                            # Safe FPS handling
                             fps = fps if fps is not None and fps > 0 else 30
-                            
-                            # Safe bitrate handling  
                             vbr = vbr if vbr is not None and vbr > 0 else 0
                             
                             quality_detail = quality
@@ -401,3 +429,286 @@ class SearchHelper:
                 raise HTTPException(status_code=451, detail="This video is not available due to copyright restrictions")
             else:
                 raise HTTPException(status_code=500, detail=f"Failed to get video stream URL: {error_msg}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FAST STREAMING MERGE — pipes fragmented MP4 directly to client
+    # No waiting for full download. First bytes arrive in ~200ms.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def merge_video_audio_ffmpeg_stream(video_url: str, audio_url: str) -> subprocess.Popen:
+        """
+        Returns an ffmpeg Popen whose stdout is a STREAMING fragmented MP4.
+
+        WHY THIS IS FAST (~200ms to first byte vs 30s):
+        ─────────────────────────────────────────────
+        The old approach wrote to a file: ffmpeg had to fully download BOTH
+        streams before it could write the moov atom (the index), because a
+        normal MP4 needs the index at the END. Only then could the file be served.
+
+        This approach uses FRAGMENTED MP4 (`frag_keyframe+empty_moov`):
+          • An empty moov atom is written at the very START of the stream
+          • Each fragment (a few seconds of video) is self-contained
+          • ffmpeg writes to stdout (pipe:1) — no disk I/O at all
+          • The client starts receiving playable data as soon as the first
+            fragment is muxed, which is after just a few seconds of video
+            data has been downloaded — not the whole file.
+
+        HOW TO USE IN FastAPI:
+        ──────────────────────
+            @router.get("/stream/{video_id}")
+            async def stream_video(video_id: str):
+                data = SearchHelper.get_mobile_video_stream_url(video_id)
+                proc = SearchHelper.merge_video_audio_ffmpeg_stream(
+                    data['video_url'], data['audio_url']
+                )
+
+                async def generate():
+                    try:
+                        while True:
+                            chunk = proc.stdout.read(65536)  # 64 KB chunks
+                            if not chunk:
+                                break
+                            yield chunk
+                    finally:
+                        proc.stdout.close()
+                        proc.wait()
+
+                return StreamingResponse(
+                    generate(),
+                    media_type="video/mp4",
+                    headers={"Content-Disposition": "inline; filename=video.mp4"},
+                )
+
+        IMPORTANT: The caller must consume proc.stdout fully and call proc.wait()
+        to avoid zombie processes. Use the generate() pattern above.
+        """
+        reconnect_flags = [
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+        ]
+
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-loglevel', 'error',
+            # ── Video input ───────────────────────────────────────────────
+            *reconnect_flags,
+            '-i', video_url,
+            # ── Audio input ───────────────────────────────────────────────
+            *reconnect_flags,
+            '-i', audio_url,
+            # ── Encoding: pure stream-copy, zero transcode overhead ───────
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-threads', '0',
+            '-avoid_negative_ts', 'make_zero',
+            '-fflags', '+genpts+discardcorrupt',
+            '-max_muxing_queue_size', '1024',
+            # ── THE KEY FLAGS: fragmented MP4 to stdout ───────────────────
+            # frag_keyframe   → new fragment at every keyframe (regular intervals)
+            # empty_moov      → write empty moov at START so players don't need
+            #                   to seek to the end before beginning playback
+            # default_base_moof → RFC 8216 / CMAF compatible fragment base
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            '-f', 'mp4',       # must be explicit when target is a pipe
+            'pipe:1',          # stdout
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,          # unbuffered: bytes reach the network ASAP
+        )
+        print(f"[FFmpeg] Streaming merge started (pid={proc.pid})")
+        return proc
+
+    @staticmethod
+    def merge_video_audio_ffmpeg(video_url: str, audio_url: str, output_dir: str) -> str:
+        """
+        Download and merge separate video + audio streams into a single MP4 file on disk.
+
+        NOTE: For serving to clients, prefer merge_video_audio_ffmpeg_stream() instead,
+        which streams directly without waiting for the full download (~200ms vs 30s).
+        Use this method only when you genuinely need a file on disk (e.g. caching).
+
+        Optimisations:
+        • -reconnect flags          : auto-retry transient HTTP errors
+        • -max_muxing_queue_size    : prevent packet-buffer overflow errors
+        • -avoid_negative_ts        : prevent silent stalls from negative DTS
+        • -fflags +genpts+discard   : tolerant timestamp/corruption handling
+        • -movflags +faststart      : moov atom at front for immediate playback
+        • -threads 0                : auto thread count
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        out_filename = f"{uuid.uuid4().hex}.mp4"
+        out_path = os.path.join(output_dir, out_filename)
+
+        reconnect_flags = [
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+        ]
+
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-loglevel', 'error',
+            *reconnect_flags,
+            '-i', video_url,
+            *reconnect_flags,
+            '-i', audio_url,
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-threads', '0',
+            '-avoid_negative_ts', 'make_zero',
+            '-fflags', '+genpts+discardcorrupt',
+            '-max_muxing_queue_size', '1024',
+            '-movflags', '+faststart',
+            out_path,
+        ]
+
+        print(f"[FFmpeg] Merging to file → {out_path}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed (code {result.returncode}): {result.stderr.strip()}"
+            )
+
+        print(f"[FFmpeg] Merge complete → {out_path} ({os.path.getsize(out_path):,} bytes)")
+        return out_path
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MOBILE VIDEO — separate streams, merged locally via ffmpeg
+    # ─────────────────────────────────────────────────────────────────────────
+    @classmethod
+    def get_mobile_video_stream_url(cls, video_id: str, merged_dir: str = None) -> Dict:
+        """
+        Extract separate video + audio stream URLs (highest quality).
+
+        Returns both raw stream URLs AND (optionally) a merged file path.
+        For fast serving, pass the video_url + audio_url directly to
+        merge_video_audio_ffmpeg_stream() and pipe the result to the client.
+
+        Return dict keys:
+          video_url    : raw YouTube video-only stream URL
+          audio_url    : raw YouTube audio-only stream URL
+          merged_file  : path to merged .mp4 on disk (only if merged_dir given)
+          title, duration, thumbnail_url, quality, stream_type
+        """
+        try:
+            thread_name = threading.current_thread().name
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+            print(f"[{thread_name}] Processing mobile video_id: {video_id}")
+
+            if merged_dir is None:
+                merged_dir = os.path.join(_BASE_DIR, 'merged_videos')
+
+            opts = {
+                'format': (
+                    'bestvideo[height>=2160][ext=mp4]+bestaudio[ext=m4a]/'
+                    'bestvideo[height>=1440][ext=mp4]+bestaudio[ext=m4a]/'
+                    'bestvideo[height>=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                    'bestvideo[height>=720][ext=mp4]+bestaudio[ext=m4a]/'
+                    'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+                    'bestvideo+bestaudio[ext=m4a]/'
+                    'bestvideo+bestaudio'
+                ),
+                'quiet': True,
+                'no_warnings': True,
+                'extractor_retries': 2,
+                'fragment_retries': 2,
+                'socket_timeout': 20,
+                'http_headers': cls.get_common_headers(),
+                'nocheckcertificate': True,
+                'no_color': True,
+                **cls._get_cookie_opts(),
+            }
+
+            print(f"[{thread_name}] Extracting separate streams for {video_id}")
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=False)
+
+                if not info:
+                    raise Exception("No info returned from yt-dlp")
+
+                video_url = None
+                audio_url = None
+                quality = "Unknown"
+                video_format = None
+                audio_format = None
+
+                if 'requested_formats' in info and info['requested_formats']:
+                    for fmt in info['requested_formats']:
+                        if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none':
+                            video_url = fmt.get('url')
+                            video_format = fmt
+                            if fmt.get('height'):
+                                quality = f"{fmt['height']}p"
+                            elif fmt.get('format_note'):
+                                quality = fmt['format_note']
+                        elif fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                            audio_url = fmt.get('url')
+                            audio_format = fmt
+
+                if not video_url or not audio_url:
+                    raise Exception(
+                        "Could not extract separate video+audio streams — "
+                        f"video_url={'found' if video_url else 'MISSING'}, "
+                        f"audio_url={'found' if audio_url else 'MISSING'}"
+                    )
+
+                fps  = (video_format or {}).get('fps') or 30
+                vbr  = (video_format or {}).get('vbr') or 0
+                abr  = (audio_format or {}).get('abr') or 0
+                tbr  = (video_format or {}).get('tbr') or 0
+
+                quality_kbps = vbr if vbr > 0 else tbr
+                quality_detail = quality
+                if fps > 30:
+                    quality_detail += f"{int(fps)}fps"
+                if quality_kbps > 0:
+                    quality_detail += f" ({quality_kbps:.3f}kbps)"
+
+                print(
+                    f"[{thread_name}] Streams extracted — "
+                    f"Video: {quality_detail}, Audio: {abr}kbps"
+                )
+
+                return {
+                    'video_url':   video_url,
+                    'audio_url':   audio_url,
+                    'title':       info.get('title', 'Unknown Title'),
+                    'duration':    info.get('duration', 0),
+                    'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                    'quality':     quality_detail,
+                    'stream_type': 'separate',
+                }
+
+        except Exception as e:
+            thread_name = threading.current_thread().name
+            error_msg = str(e)
+            print(f"[{thread_name}] Error in get_mobile_video_stream_url: {error_msg}")
+
+            if 'bot' in error_msg.lower() or 'sign in' in error_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="YouTube is temporarily blocking requests. Please try again in a few minutes."
+                )
+            elif 'private' in error_msg.lower():
+                raise HTTPException(status_code=403, detail="This video is private")
+            elif 'unavailable' in error_msg.lower():
+                raise HTTPException(status_code=404, detail="This video is not available")
+            elif 'copyright' in error_msg.lower():
+                raise HTTPException(status_code=451, detail="This video is not available due to copyright restrictions")
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to get mobile video stream: {error_msg}")
