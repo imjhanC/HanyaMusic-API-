@@ -585,6 +585,40 @@ class SearchHelper:
 
         print(f"[FFmpeg] Merge complete → {out_path} ({os.path.getsize(out_path):,} bytes)")
         return out_path
+    
+    @staticmethod
+    def merge_video_audio_ffmpeg_to_path(video_url: str, audio_url: str, output_path: str) -> None:
+        """
+        Merge video+audio to a specific output path with faststart (moov atom at front).
+        This enables proper 206 range serving and browser timeline support.
+        """
+        reconnect_flags = [
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+        ]
+
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-loglevel', 'error',
+            *reconnect_flags,
+            '-i', video_url,
+            *reconnect_flags,
+            '-i', audio_url,
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-threads', '0',
+            '-avoid_negative_ts', 'make_zero',
+            '-fflags', '+genpts+discardcorrupt',
+            '-max_muxing_queue_size', '1024',
+            '-movflags', '+faststart',   # ← moov atom at FRONT = instant browser timeline
+            output_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # MOBILE VIDEO — separate streams, merged locally via ffmpeg

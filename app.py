@@ -88,11 +88,11 @@ class VideoStreamMobileResponse(BaseModel):
     """
     Returned by /search/exactwithMVMobile and /streamvideo/mobile/{video_id}.
 
-    stream_url  : the /video/stream/{video_id} endpoint — point your player here.
+    stream_url  : the /video/proxy/{video_id} endpoint — point your player here.
     video_url   : raw YouTube video-only URL  (useful for debugging / fallback).
     audio_url   : raw YouTube audio-only URL  (useful for debugging / fallback).
     """
-    stream_url: str          # ← the fast streaming endpoint
+    stream_url: str          # ← the seekable streaming endpoint
     video_url: str           # raw separate video stream
     audio_url: str           # raw separate audio stream
     title: str
@@ -181,9 +181,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
 # ─── Caches & Infrastructure ─────────────────────────────────────────────────
 
-search_cache      = RedisCache(prefix="hanya:search:")
-audio_cache       = RedisCache(prefix="hanya:audio:")
-video_cache       = RedisCache(prefix="hanya:video:")
+search_cache       = RedisCache(prefix="hanya:search:")
+audio_cache        = RedisCache(prefix="hanya:audio:")
+video_cache        = RedisCache(prefix="hanya:video:")
 video_mobile_cache = RedisCache(prefix="hanya:video_mobile:")
 
 request_deduplicator = RequestDeduplicator()
@@ -208,11 +208,16 @@ video_executors = [
     for i in range(3)
 ]
 
-# ─── Merged-video dir (kept for legacy / disk-cache use only) ────────────────
+# ─── Merged-video dir ────────────────────────────────────────────────────────
 _MERGED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'merged_videos')
 os.makedirs(_MERGED_DIR, exist_ok=True)
-# We keep the static mount so old cached merged_urls still resolve
 app.mount("/merged", StaticFiles(directory=_MERGED_DIR), name="merged_videos")
+
+# ─── In-progress merge deduplication ─────────────────────────────────────────
+# Prevents multiple ffmpeg processes for the same video_id when concurrent
+# requests arrive before the first merge finishes.
+_merge_in_progress: Dict[str, asyncio.Event] = {}
+_merge_lock = asyncio.Lock()
 
 # ─── Background tasks ────────────────────────────────────────────────────────
 
@@ -279,7 +284,7 @@ async def startup_event():
     asyncio.create_task(periodic_cache_cleanup())
     asyncio.create_task(update_yt_dlp_daily())
     asyncio.create_task(periodic_merged_cleanup())
-    print("🚀 High-Performance API started with MP3-only audio + fragmented MP4 streaming!")
+    print("🚀 High-Performance API started with MP3-only audio + seekable MP4 streaming!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -369,15 +374,8 @@ async def cached_video_mobile_stream(
 ) -> Tuple[VideoStreamMobileResponse, bool]:
     """
     Cache stores only the raw video_url + audio_url from yt-dlp.
-    No merging/downloading happens here at all — that is deferred to
-    /video/stream/{video_id} which pipes ffmpeg stdout straight to the client.
-
-    Timeline:
-      Cache HIT  → ~0 ms   (just return URLs)
-      Cache MISS → ~2–4 s  (yt-dlp URL extraction, no download)
-      Playback   → ~200 ms to first byte (fragmented MP4 pipe)
+    Actual merging is deferred to /video/proxy/{video_id}.
     """
-    # v3 key — intentionally different from old v2 so stale disk-path entries are ignored
     cache_key = create_cache_key("video_mobile_v3", video_id)
 
     cached_result = video_mobile_cache.get(cache_key)
@@ -391,17 +389,12 @@ async def cached_video_mobile_stream(
     async def execute_video_mobile_stream():
         executor = load_balancer.get_least_loaded_executor(video_executors)
         loop = asyncio.get_event_loop()
-
-        # get_mobile_video_stream_url now returns video_url + audio_url only (no disk merge)
         result = await loop.run_in_executor(
             executor,
             SearchHelper.get_mobile_video_stream_url,
             video_id,
         )
-
-        # Attach the streaming endpoint URL so the client knows where to point its player
-        result['stream_url'] = f"{base_url}/video/stream/{video_id}"
-
+        result['stream_url'] = f"{base_url}/video/proxy/{video_id}"
         video_mobile_cache.set(cache_key, result, ttl_minutes=45)
         return result
 
@@ -410,28 +403,16 @@ async def cached_video_mobile_stream(
     return result, False
 
 
-# ─── Fast fragmented-MP4 streaming endpoint ──────────────────────────────────
+# ─── Fast fragmented-MP4 streaming endpoint (non-seekable, for legacy use) ───
 
 @app.get("/video/stream/{video_id}")
 async def stream_mobile_video(video_id: str, request: Request):
     """
     Streams a merged MP4 (video + audio) directly to the client via ffmpeg pipe.
-
-    HOW IT WORKS
-    ────────────
-    1. Look up cached video_url + audio_url (or extract fresh ones via yt-dlp).
-    2. Spawn ffmpeg with `-movflags frag_keyframe+empty_moov` writing to stdout.
-    3. Pipe ffmpeg's stdout straight to the HTTP response as a StreamingResponse.
-
-    Result: the client receives the first playable fragment in ~200 ms — there is
-    no waiting for the full file to download.  The player can seek because each
-    fragment is self-contained (CMAF/fMP4 format).
-
-    Your mobile player should use this URL directly as its video source, e.g.:
-        AVPlayer(url: URL(string: streamUrl)!)
-        ExoPlayer.setMediaItem(MediaItem.fromUri(streamUrl))
+    NOTE: This endpoint does NOT support seeking. For a seekable player, use
+    /video/proxy/{video_id} instead — it serves a fully merged file with 206
+    range support once the merge completes.
     """
-    # ── 1. Get stream URLs (from cache or fresh) ──────────────────────────────
     cache_key = create_cache_key("video_mobile_v3", video_id)
     cached = video_mobile_cache.get(cache_key)
 
@@ -451,29 +432,24 @@ async def stream_mobile_video(video_id: str, request: Request):
         video_url = data['video_url']
         audio_url = data['audio_url']
         base_url  = str(request.base_url).rstrip('/')
-        data['stream_url'] = f"{base_url}/video/stream/{video_id}"
+        data['stream_url'] = f"{base_url}/video/proxy/{video_id}"
         video_mobile_cache.set(cache_key, data, ttl_minutes=45)
 
-    # ── 2. Start ffmpeg streaming process ────────────────────────────────────
     proc = SearchHelper.merge_video_audio_ffmpeg_stream(video_url, audio_url)
 
-    # ── 3. Async generator that reads ffmpeg stdout in 64 KB chunks ──────────
     async def generate() -> AsyncGenerator[bytes, None]:
         loop = asyncio.get_event_loop()
         try:
             while True:
-                # run_in_executor so the blocking read() doesn't stall the event loop
                 chunk: bytes = await loop.run_in_executor(None, proc.stdout.read, 65536)
                 if not chunk:
                     break
                 yield chunk
         except asyncio.CancelledError:
-            # Client disconnected — kill ffmpeg immediately so it doesn't linger
             print(f"[STREAM] Client disconnected for {video_id}, killing ffmpeg pid={proc.pid}")
             proc.kill()
             raise
         finally:
-            # Always clean up: drain stderr for logs, then wait for process exit
             try:
                 proc.stdout.close()
                 stderr_output = proc.stderr.read()
@@ -489,10 +465,191 @@ async def stream_mobile_video(video_id: str, request: Request):
         generate(),
         media_type="video/mp4",
         headers={
-            # inline so browsers/players attempt to play rather than download
             "Content-Disposition": f"inline; filename={video_id}.mp4",
-            # Fragmented MP4 is suitable for streaming; advertise this
             "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+# ─── Seekable proxy endpoint — merges to disk, serves with 206 range support ─
+
+@app.get("/video/proxy/{video_id}")
+async def proxy_video(video_id: str, request: Request):
+    """
+    Serves a fully merged MP4 with HTTP 206 range support so players can seek.
+
+    First request:
+      • Waits for ffmpeg to merge video+audio to disk (~10–30s depending on
+        video length and bandwidth).
+      • Concurrent requests for the same video_id wait on an asyncio.Event
+        rather than spawning duplicate ffmpeg processes.
+      • Falls back to a non-seekable pipe stream if the merge fails.
+
+    Subsequent requests:
+      • The merged file is served immediately from disk with full 206 range
+        support — seeking, timeline scrubbing, and duration display all work.
+
+    The periodic_merged_cleanup task removes files older than 2 hours so disk
+    usage stays bounded.
+    """
+    import aiofiles
+
+    # ── 1. Resolve stream URLs (cache or fresh yt-dlp extraction) ────────────
+    cache_key = create_cache_key("video_mobile_v3", video_id)
+    cached = video_mobile_cache.get(cache_key)
+
+    if not cached:
+        executor = load_balancer.get_least_loaded_executor(video_executors)
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            executor, SearchHelper.get_mobile_video_stream_url, video_id
+        )
+        base_url = str(request.base_url).rstrip('/')
+        data['stream_url'] = f"{base_url}/video/proxy/{video_id}"
+        video_mobile_cache.set(cache_key, data, ttl_minutes=45)
+        cached = data
+
+    video_url   = cached['video_url']
+    audio_url   = cached['audio_url']
+    merged_path = os.path.join(_MERGED_DIR, f"{video_id}.mp4")
+
+    # ── 2. Helper: serve the merged file with full 206 range support ──────────
+    async def serve_merged_file():
+        file_size    = os.path.getsize(merged_path)
+        range_header = request.headers.get("range")
+        start, end   = 0, file_size - 1
+
+        if range_header and range_header.startswith("bytes="):
+            try:
+                parts = range_header[6:].split("-")
+                start = int(parts[0]) if parts[0] else 0
+                end   = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+            except ValueError:
+                pass
+
+        end        = min(end, file_size - 1)
+        chunk_size = end - start + 1
+
+        async def file_generator():
+            async with aiofiles.open(merged_path, "rb") as f:
+                await f.seek(start)
+                remaining = chunk_size
+                while remaining > 0:
+                    data = await f.read(min(65536, remaining))
+                    if not data:
+                        break
+                    yield data
+                    remaining -= len(data)
+
+        return StreamingResponse(
+            file_generator(),
+            status_code=206 if range_header else 200,
+            media_type="video/mp4",
+            headers={
+                "Content-Range":   f"bytes {start}-{end}/{file_size}",
+                "Content-Length":  str(chunk_size),
+                "Accept-Ranges":   "bytes",
+                "Cache-Control":   "public, max-age=3600",
+                "Content-Disposition": f"inline; filename={video_id}.mp4",
+            },
+        )
+
+    # ── 3. Fast path: merged file already on disk ─────────────────────────────
+    if os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000:
+        print(f"[PROXY] Serving cached merged file for {video_id}")
+        return await serve_merged_file()
+
+    # ── 4. Slow path: need to merge — deduplicate concurrent requests ─────────
+    #
+    # _merge_in_progress maps video_id → asyncio.Event.
+    # The first request creates the Event and does the merge.
+    # All subsequent concurrent requests await the same Event.
+    #
+    async with _merge_lock:
+        if video_id in _merge_in_progress:
+            # Another coroutine is already merging this video — wait for it.
+            merge_event = _merge_in_progress[video_id]
+            i_am_merger = False
+        else:
+            # We are first — create the event and take ownership of the merge.
+            merge_event = asyncio.Event()
+            _merge_in_progress[video_id] = merge_event
+            i_am_merger = True
+
+    if not i_am_merger:
+        # ── 4a. Wait for the in-progress merge to finish ──────────────────
+        print(f"[PROXY] Waiting for in-progress merge for {video_id}...")
+        try:
+            await asyncio.wait_for(merge_event.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Video merge timed out")
+
+        if os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000:
+            return await serve_merged_file()
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Video merge failed. Please try again."
+            )
+
+    # ── 4b. We are the merger — run ffmpeg in a thread pool ──────────────────
+    print(f"[PROXY] Starting foreground merge for {video_id}...")
+    merge_succeeded = False
+    try:
+        executor = load_balancer.get_least_loaded_executor(video_executors)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            executor,
+            lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
+                video_url, audio_url, merged_path
+            )
+        )
+        merge_succeeded = True
+        print(
+            f"[PROXY] Merge complete for {video_id} "
+            f"({os.path.getsize(merged_path):,} bytes)"
+        )
+    except Exception as e:
+        print(f"[PROXY] Merge failed for {video_id}: {e}")
+    finally:
+        # Always signal waiting coroutines and remove from the in-progress map
+        merge_event.set()
+        async with _merge_lock:
+            _merge_in_progress.pop(video_id, None)
+
+    if merge_succeeded:
+        return await serve_merged_file()
+
+    # ── 4c. Merge failed — fall back to non-seekable pipe stream ─────────────
+    print(f"[PROXY] Falling back to pipe stream for {video_id} (seeking will not work)")
+    proc = SearchHelper.merge_video_audio_ffmpeg_stream(video_url, audio_url)
+
+    async def generate_fallback() -> AsyncGenerator[bytes, None]:
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, proc.stdout.read, 65536)
+                if not chunk:
+                    break
+                yield chunk
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        finally:
+            try:
+                proc.stdout.close()
+                proc.stderr.read()
+                proc.stderr.close()
+            except Exception:
+                pass
+            proc.wait()
+
+    return StreamingResponse(
+        generate_fallback(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f"inline; filename={video_id}.mp4",
             "Cache-Control": "no-cache",
         },
     )
@@ -623,21 +780,22 @@ def get_user_details(
 @app.get("/")
 async def root(request: Request):
     return {
-        "message": "Ultra High-Performance Music Streaming API with MP3-Only Audio + fMP4 Video!",
+        "message": "Ultra High-Performance Music Streaming API with MP3-Only Audio + Seekable MP4 Video!",
         "performance": {
             "search_threads": 12,
             "audio_stream_threads": 12,
             "video_stream_threads": 12,
             "total_threads": 36,
             "audio_format": "MP3 ONLY (320kbps preferred)",
-            "video_mobile": "Fragmented MP4 pipe — ~200ms to first byte",
+            "video_mobile": "Seekable MP4 via disk merge + 206 range support",
             "features": [
                 "Advanced caching system",
                 "Request deduplication",
                 "Load balancing",
                 "Multiple thread pools per endpoint",
                 "MP3-only audio streaming",
-                "Fragmented MP4 mobile video streaming (no disk write)",
+                "Seekable MP4 mobile video streaming (206 range support)",
+                "Concurrent merge deduplication (no duplicate ffmpeg processes)",
                 "Auto yt-dlp updates (startup + daily at midnight)"
             ]
         }
@@ -743,11 +901,14 @@ async def search_exact_music_with_mv_mobile(
     artist: str = Query(...)
 ):
     """
-    Search for a music video and return URLs for fast fragmented-MP4 streaming.
+    Search for a music video and return URLs for seekable MP4 streaming.
 
-    The key field in the response is `stream_url` — point your mobile video
-    player directly at this URL.  The player will receive a playable fragmented
-    MP4 within ~200 ms without downloading the whole file first.
+    Point your mobile video player at the returned `stream_url`.
+
+    First play will wait ~10–30s while the server merges video+audio to disk,
+    after which the player receives a fully seekable response with correct
+    duration and timeline support. Subsequent plays of the same video are
+    instant (served from the disk cache).
     """
     if not song_title or len(song_title.strip()) < 2:
         raise HTTPException(status_code=400, detail="Song title must be at least 2 characters")
@@ -827,6 +988,7 @@ async def get_video_stream_mobile(request: Request, video_id: str):
     """
     Get stream info for mobile video playback.
     Use the returned `stream_url` as your player's video source.
+    The URL supports 206 range requests for full seeking support.
     """
     if not video_id:
         raise HTTPException(status_code=400, detail="Video ID is required")
@@ -915,7 +1077,7 @@ async def health_check(request: Request):
         "status": "healthy",
         "service": "Ultra High-Performance Music Streaming API",
         "audio_format": "MP3 ONLY (320kbps preferred)",
-        "video_mobile": "Fragmented MP4 pipe (~200ms to first byte)",
+        "video_mobile": "Seekable MP4 via disk merge + 206 range support",
         "thread_pools": {
             "search_pools": len(search_executors),
             "audio_pools": len(audio_executors),
@@ -939,13 +1101,16 @@ async def performance_stats(request: Request):
         "video":  sum(len(e._threads) if e._threads else 0 for e in video_executors),
     }
     return {
-        "performance_optimization": "ULTRA ACTIVE with MP3-ONLY AUDIO + fMP4 VIDEO",
+        "performance_optimization": "ULTRA ACTIVE with MP3-ONLY AUDIO + SEEKABLE MP4 VIDEO",
         "architecture": {
-            "search_endpoint":      f"{len(search_executors)} pools × 4 threads = 12 total",
+            "search_endpoint":       f"{len(search_executors)} pools × 4 threads = 12 total",
             "audio_stream_endpoint": f"{len(audio_executors)} pools × 4 threads = 12 total (MP3 ONLY)",
             "video_stream_endpoint": f"{len(video_executors)} pools × 4 threads = 12 total",
-            "total_worker_threads": 36,
-            "mobile_video": "ffmpeg fragmented MP4 → stdout → StreamingResponse (no disk I/O)"
+            "total_worker_threads":  36,
+            "mobile_video": (
+                "ffmpeg merges to disk → 206 range responses (full seeking). "
+                "First play waits for merge; all subsequent plays are instant from disk cache."
+            )
         },
         "active_threads": active_threads,
         "cache_performance": {
@@ -953,14 +1118,15 @@ async def performance_stats(request: Request):
             "audio_cache":        {**audio_cache.stats(),        "ttl_minutes": 60},
             "video_cache":        {**video_cache.stats(),        "ttl_minutes": 45},
             "video_mobile_cache": {**video_mobile_cache.stats(), "ttl_minutes": 45,
-                                   "note": "Stores raw YT stream URLs only — no merged files"},
+                                   "note": "Stores raw YT stream URLs only"},
         },
         "concurrent_performance": {
             "max_simultaneous_search": 12,
             "max_simultaneous_audio":  12,
             "max_simultaneous_video":  12,
-            "request_deduplication": "Active",
-            "load_balancing": "Active",
+            "request_deduplication":   "Active",
+            "load_balancing":          "Active",
+            "merge_deduplication":     "Active (asyncio.Event per video_id)",
         }
     }
 
@@ -1000,7 +1166,8 @@ async def realtime_performance(request: Request):
     return {
         "timestamp": datetime.now().isoformat(),
         "audio_format": "MP3 ONLY",
-        "mobile_video": "Fragmented MP4 pipe — ~200ms to first byte, zero disk I/O",
+        "mobile_video": "Seekable MP4 — disk merge + 206 range support",
+        "active_merges": list(_merge_in_progress.keys()),
         "thread_utilization": {
             "search_pools": [{"pool_id": i, "active": len(e._threads) if e._threads else 0, "max": e._max_workers} for i, e in enumerate(search_executors)],
             "audio_pools":  [{"pool_id": i, "active": len(e._threads) if e._threads else 0, "max": e._max_workers} for i, e in enumerate(audio_executors)],
@@ -1027,12 +1194,21 @@ async def format_info(request: Request):
             "endpoint": "/streamvideo/{video_id}"
         },
         "video_streaming_mobile": {
-            "format": "Fragmented MP4 (fMP4/CMAF)",
-            "latency": "~200ms to first byte",
-            "disk_io": "None — ffmpeg pipes directly to client",
-            "endpoint": "/video/stream/{video_id}",
+            "format": "MP4 (fully merged, moov atom at front)",
+            "seeking": "Full 206 range support — timeline scrubbing and duration display work",
+            "first_play_latency": "~10–30s (ffmpeg disk merge, runs once per video)",
+            "subsequent_play_latency": "~0ms (served from disk cache)",
+            "disk_cleanup": "Merged files auto-deleted after 2 hours",
+            "endpoint": "/video/proxy/{video_id}",
             "usage": "Point AVPlayer / ExoPlayer directly at this URL"
         },
+        "video_streaming_mobile_pipe": {
+            "format": "Fragmented MP4 (fMP4, no seeking)",
+            "latency": "~200ms to first byte",
+            "seeking": "Not supported",
+            "endpoint": "/video/stream/{video_id}",
+            "usage": "Use only if you need instant start and don't need seeking"
+        }
     }
 
 
@@ -1041,7 +1217,8 @@ if __name__ == "__main__":
     print("🌐 API: http://localhost:8000")
     print("📚 Docs: http://localhost:8000/docs")
     print("📊 Stats: http://localhost:8000/stats")
-    print("🎥 Mobile stream: /video/stream/{video_id}  (~200ms to first byte)")
+    print("🎥 Seekable video: /video/proxy/{video_id}  (206 range, full seeking)")
+    print("⚡ Pipe stream:    /video/stream/{video_id} (~200ms start, no seeking)")
 
     uvicorn.run(
         "app:app",
@@ -1052,13 +1229,16 @@ if __name__ == "__main__":
         access_log=True,
         workers=1
     )
+
 # Usage Examples:
-# Search: /search?q=aespa 
-# Audio: /stream/5oQVTnq-UKk  
-# Video: /streamvideo/5oQVTnq-UKk 
-# Stats: /stats
-# Format: /format/info 
+# Search:        /search?q=aespa
+# Audio:         /stream/5oQVTnq-UKk
+# Video:         /streamvideo/5oQVTnq-UKk
+# Mobile video:  /video/proxy/5oQVTnq-UKk   ← seekable, use this in AVPlayer/ExoPlayer
+# Stats:         /stats
+# Format info:   /format/info
 
 # To start with ngrok:
 # ngrok http --domain=instinctually-monosodium-shawnda.ngrok-free.app 8000
 # https://instinctually-monosodium-shawnda.ngrok-free.app/
+# cloudflared tunnel --url http://localhost:8000

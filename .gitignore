@@ -3,3 +3,4 @@ __pycache__/
 .env
 venv/
 Server Info (Do Not Push)/
+merged_videos/
