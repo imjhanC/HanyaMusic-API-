@@ -1,4 +1,3 @@
-
 import redis
 import json
 import logging
@@ -11,11 +10,11 @@ class RedisCache:
     Handles serialization, TTL, and connection errors gracefully.
     """
     
-    def __init__(self, host='localhost', port=6379, db=0, prefix='hanya:'):
+    def __init__(self, host: str = 'localhost', port: int = 6379, db: int = 0, prefix: str = 'hanya:'):
         self.prefix = prefix
-        self.enabled = False
+        self._enabled = False
         try:
-            self.client = redis.Redis(
+            self._client = redis.Redis(
                 host=host, 
                 port=port, 
                 db=db, 
@@ -23,26 +22,30 @@ class RedisCache:
                 socket_connect_timeout=2
             )
             # Test connection
-            self.client.ping()
-            self.enabled = True
+            self._client.ping()
+            self._enabled = True
             print(f"[REDIS] Connected successfully to {host}:{port}/db{db}")
         except redis.ConnectionError as e:
             print(f"[REDIS] Connection failed: {e}. Caching disabled.")
-            self.enabled = False
         except Exception as e:
             print(f"[REDIS] Initialization error: {e}. Caching disabled.")
-            self.enabled = False
+
+    @property
+    def is_enabled(self) -> bool:
+        """Check if cache is enabled."""
+        return self._enabled
 
     def _get_key(self, key: str) -> str:
+        """Format the full Redis key with prefix."""
         return f"{self.prefix}{key}"
 
     def get(self, key: str) -> Optional[Any]:
         """Get a value from cache. Returns None if miss or error."""
-        if not self.enabled:
+        if not self._enabled:
             return None
             
         try:
-            data = self.client.get(self._get_key(key))
+            data = self._client.get(self._get_key(key))
             if data:
                 return json.loads(data)
             return None
@@ -52,13 +55,13 @@ class RedisCache:
 
     def set(self, key: str, value: Any, ttl_minutes: int = 60) -> bool:
         """Set a value in cache with TTL."""
-        if not self.enabled:
+        if not self._enabled:
             return False
             
         try:
             serialized = json.dumps(value)
             full_key = self._get_key(key)
-            self.client.setex(
+            self._client.setex(
                 full_key,
                 timedelta(minutes=ttl_minutes),
                 serialized
@@ -73,11 +76,11 @@ class RedisCache:
 
     def delete(self, key: str) -> bool:
         """Delete a key from cache."""
-        if not self.enabled:
+        if not self._enabled:
             return False
             
         try:
-            self.client.delete(self._get_key(key))
+            self._client.delete(self._get_key(key))
             return True
         except Exception as e:
             print(f"[REDIS] Error deleting key {key}: {e}")
@@ -85,17 +88,19 @@ class RedisCache:
 
     def clear(self) -> bool:
         """Clear all keys with this prefix."""
-        if not self.enabled:
+        if not self._enabled:
             return False
             
         try:
             # Efficiently scan and delete only keys with our prefix
-            cursor = '0'
+            cursor = 0
             match_pattern = f"{self.prefix}*"
-            while cursor != 0:
-                cursor, keys = self.client.scan(cursor=cursor, match=match_pattern, count=100)
+            while True:
+                cursor, keys = self._client.scan(cursor=cursor, match=match_pattern, count=100)
                 if keys:
-                    self.client.delete(*keys)
+                    self._client.delete(*keys)
+                if cursor == 0:
+                    break
             print(f"[REDIS] Cleared all keys with prefix {self.prefix}")
             return True
         except Exception as e:
@@ -104,17 +109,17 @@ class RedisCache:
             
     def stats(self) -> Dict[str, Any]:
         """Get Redis stats."""
-        if not self.enabled:
+        if not self._enabled:
             return {"status": "disabled", "error": "Connection failed"}
             
         try:
-            info = self.client.info()
+            info = self._client.info()
             return {
                 "status": "online",
                 "used_memory_human": info.get('used_memory_human'),
                 "connected_clients": info.get('connected_clients'),
                 "uptime_days": info.get('uptime_in_days'),
-                "total_keys": self.client.dbsize()
+                "total_keys": self._client.dbsize()
             }
         except Exception:
             return {"status": "error_fetching_stats"}

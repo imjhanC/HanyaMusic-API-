@@ -150,6 +150,7 @@ class SearchHelper:
 
     @classmethod
     def get_audio_stream_url(cls, video_id: str) -> Dict:
+        """Extract a high-quality audio stream URL for a given YouTube video ID."""
         thread_name = threading.current_thread().name
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         print(f"[{thread_name}] Audio extract for {video_id}")
@@ -216,6 +217,7 @@ class SearchHelper:
 
     @classmethod
     def get_video_stream_url(cls, video_id: str) -> Dict:
+        """Extract high-quality video (and audio) stream URLs for a given YouTube video ID."""
         try:
             thread_name = threading.current_thread().name
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -296,35 +298,10 @@ class SearchHelper:
             else:
                 raise HTTPException(status_code=500, detail=f"Failed to get video stream: {error_msg}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ffmpeg helpers
-    #
-    # WHY THESE SPECIFIC FLAGS:
-    #
-    # -reconnect 1                : retry on dropped HTTP connections
-    # -reconnect_streamed 1       : retry even on non-seekable streams (YouTube)
-    # -reconnect_delay_max 3      : wait at most 3 s between retries
-    #
-    # These three are the only HTTP flags that work on ALL ffmpeg builds with
-    # the built-in http/https demuxer. Flags like -buffer_size, -multiple_requests,
-    # -seekable, and -rw_timeout require specific build options that are NOT
-    # present in standard distro packages (apt/brew/etc.) and cause:
-    #   "Option buffer_size not found. Error opening input files."
-    #
-    # -thread_queue_size 1024     : bigger packet queue per input so video and
-    #                               audio downloading threads don't block each other
-    # -max_muxing_queue_size 2048 : prevents queue overflow on high-bitrate streams
-    # -probesize 10M              : probe format faster (avoid extra HTTP round-trips)
-    # -analyzeduration 2000000    : 2 s max analysis — YouTube streams need no more
-    # -movflags +faststart        : moov atom at front so players can seek immediately
-    # ─────────────────────────────────────────────────────────────────────────
-
     @staticmethod
-    def _reconnect_flags() -> list:
+    def _get_reconnect_flags() -> list:
         """
         Safe ffmpeg HTTP reconnect flags that work on all standard builds.
-        Do NOT add -buffer_size, -multiple_requests, -seekable, or -rw_timeout
-        here — those require non-standard build options and will crash ffmpeg.
         """
         return [
             '-reconnect',           '1',
@@ -336,14 +313,13 @@ class SearchHelper:
     def merge_video_audio_ffmpeg_stream(video_url: str, audio_url: str) -> subprocess.Popen:
         """
         Returns an ffmpeg Popen whose stdout is a streaming fragmented MP4.
-        Use for /video/stream/ (non-seekable pipe, ~200ms to first byte).
         """
-        rf = SearchHelper._reconnect_flags()
+        reconnect_flags = SearchHelper._get_reconnect_flags()
 
         cmd = [
             'ffmpeg', '-y', '-loglevel', 'error',
-            *rf, '-i', video_url,
-            *rf, '-i', audio_url,
+            *reconnect_flags, '-i', video_url,
+            *reconnect_flags, '-i', audio_url,
             '-c:v', 'copy',
             '-c:a', 'copy',
             '-threads', '0',
@@ -359,24 +335,18 @@ class SearchHelper:
         print(f"[FFmpeg-STREAM] pid={proc.pid} started")
         return proc
 
-    @staticmethod
-    def merge_video_audio_ffmpeg_to_path(video_url: str, audio_url: str, output_path: str) -> None:
+    @classmethod
+    def merge_video_audio_ffmpeg_to_path(cls, video_url: str, audio_url: str, output_path: str) -> None:
         """
-        OLD approach: ffmpeg HTTP download → slow (single-threaded, no fragments)
-        NEW approach: yt-dlp with concurrent_fragment_downloads=16 → fast
-        
-        We extract video_id from the cached URLs, then re-download via yt-dlp
-        directly to output_path with full fragment parallelism.
+        Download and merge video and audio streams to a specific file using ffmpeg.
         """
-        # Extract video_id from the YouTube watch URL stored alongside
-        # (we pass it through a small wrapper — see merge_video_audio_by_id below)
-        rf = SearchHelper._reconnect_flags()
+        reconnect_flags = cls._get_reconnect_flags()
         cmd = [
             'ffmpeg', '-y', '-loglevel', 'error',
             '-probesize',       '10M',
             '-analyzeduration', '2000000',
-            *rf, '-thread_queue_size', '1024', '-i', video_url,
-            *rf, '-thread_queue_size', '1024', '-i', audio_url,
+            *reconnect_flags, '-thread_queue_size', '1024', '-i', video_url,
+            *reconnect_flags, '-thread_queue_size', '1024', '-i', audio_url,
             '-c:v', 'copy', '-c:a', 'copy',
             '-threads', '0',
             '-avoid_negative_ts',     'make_zero',
@@ -395,31 +365,23 @@ class SearchHelper:
             )
         print(f"[FFmpeg-DISK] ✓ Done → {output_path} ({os.path.getsize(output_path):,} bytes)")
 
-    @staticmethod
-    def merge_video_audio_ffmpeg(video_url: str, audio_url: str, output_dir: str) -> str:
+    @classmethod
+    def merge_video_audio_ffmpeg(cls, video_url: str, audio_url: str, output_dir: str) -> str:
         """Merge to a UUID-named file in output_dir. Returns the output path."""
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, f"{uuid.uuid4().hex}.mp4")
-        SearchHelper.merge_video_audio_ffmpeg_to_path(video_url, audio_url, out_path)
+        cls.merge_video_audio_ffmpeg_to_path(video_url, audio_url, out_path)
         return out_path
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Mobile video — extract separate streams
-    # ─────────────────────────────────────────────────────────────────────────
-
     @classmethod
-    def get_mobile_video_stream_url(cls, video_id: str, merged_dir: str = None) -> Dict:
+    def get_mobile_video_stream_url(cls, video_id: str, merged_dir: Optional[str] = None) -> Dict:
         """
-        Extract separate video + audio stream URLs (highest quality).
-        Does NOT merge — merging is deferred to merge_video_audio_ffmpeg_to_path.
+        Extract separate video + audio stream URLs for mobile clients.
         """
         try:
             thread_name = threading.current_thread().name
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
             print(f"[{thread_name}] Mobile extract for {video_id}")
-
-            if merged_dir is None:
-                merged_dir = os.path.join(_BASE_DIR, 'merged_videos')
 
             opts = {
                 'format': (
@@ -510,14 +472,9 @@ class SearchHelper:
     def merge_video_audio_ytdlp_to_path(cls, video_id: str, output_path: str) -> None:
         """
         Fast merge using yt-dlp's concurrent fragment downloader (16-32 threads).
-        This is ~10-20x faster than ffmpeg's single-threaded HTTP download.
-        
-        output_path must end in .mp4 — yt-dlp will merge to that exact file.
         """
         import re
 
-        # yt-dlp wants the output template without extension handling issues,
-        # so we give it the exact path via outtmpl and force mp4 merge.
         # Strip .mp4 from output_path for outtmpl since yt-dlp adds the ext.
         outtmpl = re.sub(r'\.mp4$', '', output_path)
 
@@ -530,7 +487,7 @@ class SearchHelper:
             ),
             'merge_output_format': 'mp4',
             'outtmpl': outtmpl + '.%(ext)s',
-            'concurrent_fragment_downloads': 16,   # key speed boost
+            'concurrent_fragment_downloads': 16,
             'retries': 5,
             'fragment_retries': 5,
             'noplaylist': True,
@@ -539,7 +496,6 @@ class SearchHelper:
             'nocheckcertificate': True,
             'socket_timeout': 20,
             'http_headers': cls.get_common_headers(),
-            # movflags faststart via postprocessor args so moov atom is at front
             'postprocessor_args': {
                 'ffmpeg': ['-movflags', '+faststart']
             },
@@ -552,13 +508,10 @@ class SearchHelper:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ret = ydl.download([youtube_url])
 
-        # yt-dlp returns 0 on success
         if ret != 0:
             raise RuntimeError(f"yt-dlp download failed with return code {ret}")
 
-        # Confirm output exists (yt-dlp may write .mp4 directly)
         if not os.path.exists(output_path):
-            # Try without extension in case yt-dlp named it differently
             candidate = outtmpl + '.mp4'
             if os.path.exists(candidate) and candidate != output_path:
                 os.rename(candidate, output_path)
@@ -571,7 +524,7 @@ class SearchHelper:
     def perform_search_first_result(cls, query: str) -> Optional[str]:
         """
         Returns the first valid video_id for a query, or None.
-        Ultra-fast: extract_flat + limit=3, bails on first hit.
+        Ultra-fast search that bails on the first hit.
         """
         try:
             opts = {

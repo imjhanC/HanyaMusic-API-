@@ -285,19 +285,19 @@ async def shutdown_event():
 
 # ─── Cached helpers ───────────────────────────────────────────────────────────
 
-async def cached_search(q: str, limit: Optional[int] = None) -> Tuple[List[SearchResult], bool]:
-    cache_key = create_cache_key("search", q, limit)
+async def cached_search(query: str, limit: Optional[int] = None) -> Tuple[List[SearchResult], bool]:
+    cache_key = create_cache_key("search", query, limit)
     cached_result = search_cache.get(cache_key)
     if cached_result:
-        print(f"[SEARCH] Cache HIT for query: {q}")
+        print(f"[SEARCH] Cache HIT for query: {query}")
         return cached_result, True
 
-    print(f"[SEARCH] Cache MISS for query: {q}")
+    print(f"[SEARCH] Cache MISS for query: {query}")
 
     async def execute_search():
         executor = load_balancer.get_least_loaded_executor(search_executors)
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(executor, SearchHelper.perform_search, q.strip(), limit)
+        results = await loop.run_in_executor(executor, SearchHelper.perform_search, query.strip(), limit)
         search_cache.set(cache_key, results, ttl_minutes=15)
         return results
 
@@ -822,17 +822,17 @@ async def root(request: Request):
 @app.get("/search", response_model=List[SearchResult])
 async def search_music(
     request: Request,
-    q: str = Query(..., description="Search query for music"),
+    query: str = Query(..., alias="q", description="Search query for music"),
     limit: Optional[int] = Query(None, description="Limit number of results")
 ):
-    if not q or len(q.strip()) < 2:
+    if not query or len(query.strip()) < 2:
         raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
     try:
-        results, from_cache = await cached_search(q, limit)
+        results, from_cache = await cached_search(query, limit)
         print(f"[SEARCH] {len(results)} results {'(cached)' if from_cache else '(fresh)'}")
         return results or []
     except Exception as e:
-        print(f"[SEARCH] Error: {e}")
+        print(f"[SEARCH] Error during search for '{query}': {e}")
         raise HTTPException(status_code=500, detail="Search failed")
 
 
@@ -1313,8 +1313,6 @@ def test_db():
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/performance/realtime")
-async def realtime_performance(request: Request):
     return {
         "timestamp": datetime.now().isoformat(),
         "audio_format": "MP3 ONLY",
@@ -1326,7 +1324,7 @@ async def realtime_performance(request: Request):
             "video_pools":  [{"pool_id": i, "active": len(e._threads) if e._threads else 0, "max": e._max_workers} for i, e in enumerate(video_executors)],
         },
         "deduplication": {
-            "active_requests": len(request_deduplicator.active_requests),
+            "active_requests": len(request_deduplicator._active_requests),
             "status": "preventing duplicate processing"
         }
     }

@@ -12,16 +12,18 @@ class ITunes:
         self.timeout = timeout
 
     def _get(self, endpoint: str, params: Dict) -> Dict:
+        """Internal helper for GET requests to iTunes API."""
         url = f"{self.BASE_URL}/{endpoint}"
         try:
             response = requests.get(url, params=params, timeout=self.timeout)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            print(f"Request failed: {e}")
+            print(f"[ITUNES] Request failed: {e}")
             return {}
 
     def get_artist_id(self, artist_name: str) -> Optional[int]:
+        """Fetch the iTunes artist ID for a given artist name."""
         params = {
             "term": artist_name,
             "entity": "musicArtist",
@@ -35,9 +37,10 @@ class ITunes:
         return None
 
     def get_all_official_songs_by_artist(self, artist_name: str) -> List[Dict]:
+        """Fetch all official songs for an artist across all their albums."""
         artist_id = self.get_artist_id(artist_name)
         if not artist_id:
-            print(f"Artist '{artist_name}' not found.")
+            print(f"[ITUNES] Artist '{artist_name}' not found.")
             return []
 
         # Step 1: Get all albums
@@ -52,8 +55,6 @@ class ITunes:
         # Sort albums newest-first
         albums.sort(key=lambda x: x.get("releaseDate", ""), reverse=True)
 
-        # Deduplicate albums by name to reduce redundant track fetches (improves speed)
-        seen_albums = set()
         deduplicated_albums = []
         for album in albums:
             name_key = album.get("collectionName", "").lower().strip()
@@ -224,7 +225,7 @@ class ITunes:
     
     def get_top_global_artists_with_thumbnails(self, limit: int = 100) -> Dict:
         """
-        Get top global artists with sample thumbnail URLs for 5 random artists
+        Get top global artists with sample thumbnail URLs for 3 random artists.
         """
         artists = self.get_top_global_artists(limit=limit)
         
@@ -241,7 +242,7 @@ class ITunes:
         # Select 3 random thumbnails
         sample_thumbnails = []
         if len(all_thumbnails) >= 3:
-            sample_thumbnails = random.sample(all_thumbnails,3)
+            sample_thumbnails = random.sample(all_thumbnails, 3)
         else:
             sample_thumbnails = all_thumbnails
         
@@ -251,15 +252,15 @@ class ITunes:
             "sample_thumbnails": sample_thumbnails
         }
     
-    ## Get all top global songs 
     def get_top_global_songs(self, limit: int = 200) -> List[Dict]:
+        """Fetch the top global songs from the iTunes RSS feed."""
         url = f"https://itunes.apple.com/us/rss/topsongs/limit={limit}/json"
         try:
             response = requests.get(url, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
-            print(f"Request failed: {e}")
+            print(f"[ITUNES] Request failed for top global songs: {e}")
             return []
 
         songs = []
@@ -330,22 +331,15 @@ class ITunes:
             "sample_thumbnails": sample_thumbnails
         }
 
-    ## Get top country songs by country code
     def get_top_country_songs(self, country_code: str = "us", limit: int = 100) -> List[Dict]:
-        """
-        Get today's top songs for a specific country from iTunes RSS feed.
-
-        :param country_code: Country code (e.g., 'us', 'gb', 'jp')
-        :param limit: Number of top songs to fetch (default 100)
-        :return: List of top songs with rank, name, artist, links, and thumbnail
-        """
+        """Fetch today's top songs for a specific country from iTunes RSS feed."""
         url = f"https://itunes.apple.com/{country_code}/rss/topsongs/limit={limit}/json"
         try:
             response = requests.get(url, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
-            print(f"Request failed: {e}")
+            print(f"[ITUNES] Request failed for top {country_code} songs: {e}")
             return []
 
         songs = []
