@@ -396,29 +396,12 @@ async def cached_video_mobile_stream(
 # ─── Eager pre-merge helper ───────────────────────────────────────────────────
 
 async def trigger_pre_merge(video_id: str, video_url: str, audio_url: str) -> None:
-    """
-    Fire-and-forget coroutine: kicks off an ffmpeg disk merge as soon as the
-    search endpoint resolves a video_id — before the user's player even
-    requests /video/proxy/.
-
-    Timeline with pre-merge:
-      t=0s   search endpoint finds video_id, returns JSON to client
-      t=0s   trigger_pre_merge starts ffmpeg in background
-      t=?s   user taps play, player hits /video/proxy/
-               → if pre-merge done : instant 206 response ✓
-               → if still running  : wait on shared Event (no duplicate ffmpeg) ✓
-
-    Uses the same _merge_in_progress dict as /video/proxy/ so the two paths
-    never spawn duplicate ffmpeg processes.
-    """
     merged_path = os.path.join(_MERGED_DIR, f"{video_id}.mp4")
 
-    # Skip if file already on disk
     if os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000:
         print(f"[PRE-MERGE] Already exists for {video_id}, skipping")
         return
 
-    # Skip if a merge is already in progress
     async with _merge_lock:
         if video_id in _merge_in_progress:
             print(f"[PRE-MERGE] Merge already in progress for {video_id}, skipping")
@@ -426,25 +409,36 @@ async def trigger_pre_merge(video_id: str, video_url: str, audio_url: str) -> No
         merge_event = asyncio.Event()
         _merge_in_progress[video_id] = merge_event
 
-    print(f"[PRE-MERGE] Starting background merge for {video_id}")
+    print(f"[PRE-MERGE] Starting fast yt-dlp merge for {video_id}")
     try:
         executor = load_balancer.get_least_loaded_executor(video_executors)
         loop = asyncio.get_event_loop()
+
+        # ✅ Use fast yt-dlp concurrent fragment download instead of slow ffmpeg HTTP
         await loop.run_in_executor(
             executor,
-            lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
-                video_url, audio_url, merged_path
-            )
+            lambda: SearchHelper.merge_video_audio_ytdlp_to_path(video_id, merged_path)
         )
         print(f"[PRE-MERGE] ✓ Done for {video_id} ({os.path.getsize(merged_path):,} bytes)")
     except Exception as e:
         print(f"[PRE-MERGE] ✗ Failed for {video_id}: {e}")
-        # Remove partial/broken file so /video/proxy/ doesn't serve it
+        # Fallback to old ffmpeg method
         try:
-            if os.path.exists(merged_path):
-                os.remove(merged_path)
-        except Exception:
-            pass
+            print(f"[PRE-MERGE] Falling back to ffmpeg for {video_id}")
+            await loop.run_in_executor(
+                executor,
+                lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
+                    video_url, audio_url, merged_path
+                )
+            )
+            print(f"[PRE-MERGE] ✓ Fallback succeeded for {video_id}")
+        except Exception as e2:
+            print(f"[PRE-MERGE] ✗ Fallback also failed for {video_id}: {e2}")
+            try:
+                if os.path.exists(merged_path):
+                    os.remove(merged_path)
+            except Exception:
+                pass
     finally:
         merge_event.set()
         async with _merge_lock:
@@ -623,21 +617,28 @@ async def proxy_video(video_id: str, request: Request):
             raise HTTPException(status_code=500, detail="Video merge failed. Please retry.")
 
     # ── 4b. We are the merger (no pre-merge was triggered) ───────────────────
-    print(f"[PROXY] No pre-merge found for {video_id}, merging now...")
+    print(f"[PROXY] No pre-merge found for {video_id}, merging now (fast yt-dlp)...")
     merge_succeeded = False
     try:
         executor = load_balancer.get_least_loaded_executor(video_executors)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             executor,
-            lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
-                video_url, audio_url, merged_path
-            )
+            lambda: SearchHelper.merge_video_audio_ytdlp_to_path(video_id, merged_path)
         )
         merge_succeeded = True
-        print(f"[PROXY] ✓ Merge done for {video_id} ({os.path.getsize(merged_path):,} bytes)")
     except Exception as e:
-        print(f"[PROXY] ✗ Merge failed for {video_id}: {e}")
+        print(f"[PROXY] yt-dlp merge failed ({e}), falling back to ffmpeg...")
+        try:
+            await loop.run_in_executor(
+                executor,
+                lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
+                    video_url, audio_url, merged_path
+                )
+            )
+            merge_succeeded = True
+        except Exception as e2:
+            print(f"[PROXY] ✗ Both merge methods failed for {video_id}: {e2}")
     finally:
         merge_event.set()
         async with _merge_lock:
