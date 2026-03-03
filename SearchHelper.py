@@ -566,3 +566,40 @@ class SearchHelper:
                 raise RuntimeError(f"Expected output not found: {output_path}")
 
         print(f"[YT-DLP-MERGE] ✓ Done → {output_path} ({os.path.getsize(output_path):,} bytes)")
+
+    @classmethod
+    def perform_search_first_result(cls, query: str) -> Optional[str]:
+        """
+        Returns the first valid video_id for a query, or None.
+        Ultra-fast: extract_flat + limit=3, bails on first hit.
+        """
+        try:
+            opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': 'in_playlist',
+                'skip_download': True,
+                'ignoreerrors': True,
+                'geo_bypass': True,
+                'noplaylist': True,
+                'socket_timeout': 6,
+                'retries': 1,
+                'http_headers': cls.get_common_headers(),
+                'nocheckcertificate': True,
+                'no_color': True,
+                'extractor_args': {
+                    'youtube': {'skip': ['hls', 'dash', 'translated_subs']}
+                },
+                **cls._get_cookie_opts(),
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                results = ydl.extract_info(f"ytsearch3:{query}", download=False)
+            if not results or 'entries' not in results:
+                return None
+            for entry in results.get('entries', []):
+                if entry and cls.is_valid_video(entry):
+                    return entry.get('id')
+            return None
+        except Exception as e:
+            print(f"[FAST-SEARCH] '{query}' failed: {e}")
+            return None

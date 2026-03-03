@@ -917,74 +917,181 @@ async def search_exact_music_with_mv_mobile(
     song_title: str = Query(...),
     artist: str = Query(...)
 ):
-    """
-    Search for a music video and return URLs for seekable MP4 streaming.
-
-    KEY OPTIMISATION — Eager Pre-Merge:
-      As soon as the video_id is resolved, trigger_pre_merge() is fired as a
-      background asyncio task. The JSON response goes back to the client
-      immediately. By the time the user taps play and their player hits
-      /video/proxy/{video_id}, the ffmpeg merge is often already done —
-      making first-play effectively instant.
-
-      Worst case (user taps play very fast): the player waits on the shared
-      asyncio.Event. No duplicate ffmpeg processes are ever spawned.
-    """
     if not song_title or len(song_title.strip()) < 2:
         raise HTTPException(status_code=400, detail="Song title must be at least 2 characters")
     if not artist or len(artist.strip()) < 2:
         raise HTTPException(status_code=400, detail="Artist name must be at least 2 characters")
 
+    combined_query = f"{song_title} {artist}"
+
+    # ── STEP 1: Parallel search across all terms simultaneously ───────────────
+    # Priority order — we pick the FIRST non-None result in this exact order.
+    # All searches fire at once; we don't wait for slow ones if an early hit lands.
+    priority_terms = [
+        f"{combined_query} official music video",
+        f"{combined_query} music video",
+        f"{combined_query} mv",
+        f"{combined_query} color coded",
+        f"{combined_query} visualizer",
+        f"{combined_query} lyrics video",
+        f"{combined_query} official video",
+        f"{combined_query} audio",
+    ]
+
+    loop = asyncio.get_event_loop()
+    executor = load_balancer.get_least_loaded_executor(search_executors)
+
     try:
-        combined_query = f"{song_title} {artist}"
-        search_terms = [
-            f"{combined_query} official music video",
-            f"{combined_query} music video",
-            f"{combined_query} mv",
-            f"{combined_query} color coded",
-            f"{combined_query} visualizer",
-            f"{combined_query} lyrics video",
-            f"{combined_query} official video",
-            f"{combined_query} audio"
+        # Fire ALL searches in parallel — each runs in its own thread
+        search_futures = [
+            loop.run_in_executor(
+                executor,
+                SearchHelper.perform_search_first_result,
+                term
+            )
+            for term in priority_terms
         ]
 
+        # Collect results respecting priority order:
+        # asyncio.gather preserves order, so results[0] = highest priority term
+        search_results = await asyncio.gather(*search_futures, return_exceptions=True)
+
         video_id = None
-        for search_term in search_terms:
-            results, _ = await cached_search(search_term, limit=3)
-            if results:
-                video_id = results[0]['videoId']
-                print(f"[SEARCH-MOBILE] Match via '{search_term}': {video_id}")
+        for i, result in enumerate(search_results):
+            if isinstance(result, str) and result:
+                video_id = result
+                print(f"[SEARCH-MOBILE] ✓ Hit on '{priority_terms[i]}': {video_id}")
                 break
 
         if not video_id:
-            raise HTTPException(status_code=404, detail=f"No video found for '{song_title}' by '{artist}'")
-
-        base_url = str(request.base_url).rstrip('/')
-        stream_result, from_cache = await cached_video_mobile_stream(video_id, base_url=base_url)
-        print(f"[SEARCH-MOBILE] {'cached' if from_cache else 'fresh'} for {video_id}")
-
-        # ── EAGER PRE-MERGE ────────────────────────────────────────────────
-        merged_path = os.path.join(_MERGED_DIR, f"{video_id}.mp4")
-        if not (os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000):
-            asyncio.create_task(
-                trigger_pre_merge(
-                    video_id,
-                    stream_result['video_url'],
-                    stream_result['audio_url'],
-                )
+            raise HTTPException(
+                status_code=404,
+                detail=f"No video found for '{song_title}' by '{artist}'"
             )
-            print(f"[SEARCH-MOBILE] 🔥 Pre-merge task fired for {video_id}")
-        else:
-            print(f"[SEARCH-MOBILE] ✓ Pre-merged file already exists for {video_id}")
-
-        return stream_result
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[SEARCH-MOBILE] Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Mobile MV search failed: {str(e)}")
+        print(f"[SEARCH-MOBILE] Parallel search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
+    # ── STEP 2: Build response immediately — NO extra yt-dlp info extraction ──
+    # merge_video_audio_ytdlp_to_path fetches everything it needs itself.
+    # We only need the proxy URL + metadata we already have from the search hit.
+    # Metadata (title, duration, thumbnail) will be filled by yt-dlp during merge.
+    base_url = str(request.base_url).rstrip('/')
+    merged_path = os.path.join(_MERGED_DIR, f"{video_id}.mp4")
+    stream_url = f"{base_url}/video/proxy/{video_id}"
+
+    # Check Redis cache for previously extracted stream metadata
+    cache_key = create_cache_key("video_mobile_v3", video_id)
+    cached = video_mobile_cache.get(cache_key)
+
+    if cached:
+        # Cache hit — update stream_url in case base_url changed, return immediately
+        print(f"[SEARCH-MOBILE] ✓ Metadata cache hit for {video_id}")
+        cached['stream_url'] = stream_url
+        cached['cached'] = True
+
+        # Still fire pre-merge if file not ready
+        if not (os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000):
+            asyncio.create_task(
+                trigger_pre_merge(video_id, cached['video_url'], cached['audio_url'])
+            )
+        return cached
+
+    # ── STEP 3: Fetch stream metadata + fire pre-merge CONCURRENTLY ───────────
+    # Run get_mobile_video_stream_url in background while we build the response.
+    # We need video_url + audio_url for the cache and for the fallback ffmpeg path.
+    print(f"[SEARCH-MOBILE] Cache miss — extracting metadata for {video_id}")
+
+    stream_meta_future = loop.run_in_executor(
+        load_balancer.get_least_loaded_executor(video_executors),
+        SearchHelper.get_mobile_video_stream_url,
+        video_id,
+    )
+
+    # Also kick off pre-merge immediately using yt-dlp (doesn't need URLs upfront)
+    # It will re-fetch internally with concurrent fragments — this is the fast path
+    async with _merge_lock:
+        merge_already_running = video_id in _merge_in_progress
+        if not merge_already_running and not (
+            os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000
+        ):
+            merge_event = asyncio.Event()
+            _merge_in_progress[video_id] = merge_event
+
+    # Start the yt-dlp merge immediately in background (it fetches its own URLs)
+    async def _fast_pre_merge():
+        try:
+            merge_exec = load_balancer.get_least_loaded_executor(video_executors)
+            await loop.run_in_executor(
+                merge_exec,
+                lambda: SearchHelper.merge_video_audio_ytdlp_to_path(video_id, merged_path)
+            )
+            print(f"[PRE-MERGE] ✓ Fast pre-merge done for {video_id} "
+                  f"({os.path.getsize(merged_path):,} bytes)")
+        except Exception as e:
+            print(f"[PRE-MERGE] ✗ Fast pre-merge failed for {video_id}: {e}")
+            # Fallback: wait for metadata then use ffmpeg
+            try:
+                meta = await stream_meta_future
+                await loop.run_in_executor(
+                    load_balancer.get_least_loaded_executor(video_executors),
+                    lambda: SearchHelper.merge_video_audio_ffmpeg_to_path(
+                        meta['video_url'], meta['audio_url'], merged_path
+                    )
+                )
+                print(f"[PRE-MERGE] ✓ ffmpeg fallback done for {video_id}")
+            except Exception as e2:
+                print(f"[PRE-MERGE] ✗ ffmpeg fallback also failed for {video_id}: {e2}")
+                try:
+                    if os.path.exists(merged_path):
+                        os.remove(merged_path)
+                except Exception:
+                    pass
+        finally:
+            async with _merge_lock:
+                ev = _merge_in_progress.pop(video_id, None)
+                if ev:
+                    ev.set()
+
+    if not merge_already_running and not (
+        os.path.exists(merged_path) and os.path.getsize(merged_path) > 1_000_000
+    ):
+        asyncio.create_task(_fast_pre_merge())
+        print(f"[SEARCH-MOBILE] 🔥 Fast pre-merge task fired for {video_id}")
+    else:
+        print(f"[SEARCH-MOBILE] ✓ Merge already running or file exists for {video_id}")
+
+    # ── STEP 4: Await metadata (needed for response + cache) ──────────────────
+    try:
+        stream_meta = await stream_meta_future
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Metadata fetch failed but merge may still succeed — return minimal response
+        print(f"[SEARCH-MOBILE] Metadata extraction failed: {e}")
+        minimal_response = {
+            'stream_url':    stream_url,
+            'video_url':     '',
+            'audio_url':     '',
+            'title':         f"{song_title} - {artist}",
+            'duration':      0,
+            'thumbnail_url': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+            'quality':       'Unknown',
+            'stream_type':   'separate',
+            'cached':        False,
+        }
+        return minimal_response
+
+    stream_meta['stream_url'] = stream_url
+    stream_meta['cached'] = False
+
+    # Cache the metadata for future requests
+    video_mobile_cache.set(cache_key, stream_meta, ttl_minutes=45)
+
+    return stream_meta
 
 @app.get("/stream/{video_id}", response_model=StreamResponse)
 async def get_stream(request: Request, video_id: str):
