@@ -18,8 +18,6 @@ COOKIES_FILE = os.path.join(_BASE_DIR, 'cookies.txt')
 
 
 class SearchHelper:
-    """Helper class for YouTube search and stream URL extraction"""
-
     @staticmethod
     def format_duration_fast(seconds):
         if not seconds or seconds <= 0:
@@ -80,6 +78,7 @@ class SearchHelper:
             return False
         return True
 
+    # Perform search based on keywords and return 20 results
     @classmethod
     def perform_search(cls, query: str, limit: Optional[int] = None) -> List[Dict]:
         if not query:
@@ -148,9 +147,9 @@ class SearchHelper:
             print(f"[SEARCH] yt-dlp search failed: {e}")
             return []
 
+    # Extract high quality AUDIO STREAM from a Youtube Video ID
     @classmethod
     def get_audio_stream_url(cls, video_id: str) -> Dict:
-        """Extract a high-quality audio stream URL for a given YouTube video ID."""
         thread_name = threading.current_thread().name
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         print(f"[{thread_name}] Audio extract for {video_id}")
@@ -215,9 +214,9 @@ class SearchHelper:
         else:
             raise HTTPException(status_code=500, detail=f"Failed to get audio stream: {error_msg}")
 
+    # Extract high-quality video (and audio) stream URLs for a given YouTube video ID
     @classmethod
     def get_video_stream_url(cls, video_id: str) -> Dict:
-        """Extract high-quality video (and audio) stream URLs for a given YouTube video ID."""
         try:
             thread_name = threading.current_thread().name
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -467,12 +466,10 @@ class SearchHelper:
                 raise HTTPException(status_code=451, detail="Not available due to copyright restrictions")
             else:
                 raise HTTPException(status_code=500, detail=f"Failed to get mobile video stream: {error_msg}")
-            
+
+    # Fast merging the audio and video and download it into a video before putting it into a proxy server       
     @classmethod
     def merge_video_audio_ytdlp_to_path(cls, video_id: str, output_path: str) -> None:
-        """
-        Fast merge using yt-dlp's concurrent fragment downloader (16-32 threads).
-        """
         import re
 
         # Strip .mp4 from output_path for outtmpl since yt-dlp adds the ext.
@@ -487,7 +484,7 @@ class SearchHelper:
             ),
             'merge_output_format': 'mp4',
             'outtmpl': outtmpl + '.%(ext)s',
-            'concurrent_fragment_downloads': 16,
+            'concurrent_fragment_downloads': 128,
             'retries': 5,
             'fragment_retries': 5,
             'noplaylist': True,
@@ -522,10 +519,6 @@ class SearchHelper:
 
     @classmethod
     def perform_search_first_result(cls, query: str) -> Optional[str]:
-        """
-        Returns the first valid video_id for a query, or None.
-        Ultra-fast search that bails on the first hit.
-        """
         try:
             opts = {
                 'quiet': True,

@@ -19,7 +19,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import create_engine, text
 import os
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv() ##Load the env file
 import base64
 
 # Importing other classes
@@ -511,19 +511,6 @@ async def stream_mobile_video(video_id: str, request: Request):
 
 @app.get("/video/proxy/{video_id}")
 async def proxy_video(video_id: str, request: Request):
-    """
-    Serves a fully merged MP4 with HTTP 206 range support (full seeking,
-    duration display, timeline scrubbing).
-
-    If the eager pre-merge (triggered by the search endpoint) already finished,
-    the file is on disk and this returns instantly with a 206 response.
-
-    If the pre-merge is still running, this waits on the shared asyncio.Event —
-    no duplicate ffmpeg processes are spawned.
-
-    If no pre-merge was triggered (direct URL access), this runs the merge
-    itself and waits for it to complete.
-    """
     import aiofiles
 
     # ── 1. Resolve stream URLs ────────────────────────────────────────────────

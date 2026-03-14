@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-start.py — HanyaMusic launcher  (v2 — retry edition)
-  1. Starts the FastAPI app via uvicorn (subprocess)
-  2. Starts cloudflared tunnel, retrying up to MAX_CF_RETRIES times on failure
-  3. Parses the trycloudflare.com URL from stdout OR stderr
-  4. Pushes { "tunnel_url": "https://..." } to Firebase RTDB at /firebase.json
-"""
-
 import subprocess
 import threading
 import sys
@@ -17,7 +8,6 @@ import urllib.error
 import json
 import signal
 
-# ── Config ────────────────────────────────────────────────────────────────────
 FIREBASE_URL   = "https://hanyamusic-ac4ce-default-rtdb.asia-southeast1.firebasedatabase.app/firebase.json"
 LOCAL_PORT     = 8000
 APP_MODULE     = "app:app"
@@ -25,12 +15,10 @@ VENV_PYTHON    = sys.executable   # honours whichever venv/python ran this scrip
 MAX_CF_RETRIES = 10               # retry cloudflared this many times before giving up
 CF_RETRY_DELAY = 5                # seconds to wait between retries
 
-# ── Globals ───────────────────────────────────────────────────────────────────
 _procs        = []
-_tunnel_found = threading.Event()   # set once the URL has been pushed
+_tunnel_found = threading.Event()   
 
-# ── Firebase ──────────────────────────────────────────────────────────────────
-
+# This method is to push the cloudflare url to Firebase
 def push_to_firebase(tunnel_url: str) -> None:
     payload = json.dumps({"tunnel_url": tunnel_url}).encode("utf-8")
     req = urllib.request.Request(
@@ -51,10 +39,8 @@ def push_to_firebase(tunnel_url: str) -> None:
             time.sleep(2)
     print("[FIREBASE] ✗ All attempts failed — URL NOT pushed to Firebase.")
 
-# ── Stream reader ─────────────────────────────────────────────────────────────
-
+# Stream reader
 URL_RE = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
-
 def _read_stream(stream, label: str) -> None:
     """Mirror cloudflared output to terminal; grab tunnel URL when it appears."""
     for raw in stream:
@@ -73,8 +59,6 @@ def _read_stream(stream, label: str) -> None:
                     target=push_to_firebase, args=(tunnel_url,), daemon=True
                 ).start()
 
-# ── Uvicorn ───────────────────────────────────────────────────────────────────
-
 def start_uvicorn() -> subprocess.Popen:
     cmd = [
         VENV_PYTHON, "-m", "uvicorn",
@@ -88,8 +72,6 @@ def start_uvicorn() -> subprocess.Popen:
     _procs.append(proc)
     return proc
 
-# ── Wait for uvicorn ──────────────────────────────────────────────────────────
-
 def _wait_for_uvicorn(timeout: int = 30) -> bool:
     import socket
     deadline = time.time() + timeout
@@ -101,12 +83,10 @@ def _wait_for_uvicorn(timeout: int = 30) -> bool:
             time.sleep(0.5)
     return False
 
-# ── Cloudflared (with retry) ──────────────────────────────────────────────────
-
 def cloudflared_loop() -> None:
     print("[LAUNCHER] Waiting for uvicorn to accept connections...")
     if not _wait_for_uvicorn(timeout=30):
-        print("[LAUNCHER] ⚠️  uvicorn didn't respond in 30 s — starting cloudflared anyway")
+        print("[LAUNCHER]  uvicorn didn't respond in 30 s — starting cloudflared")
 
     for attempt in range(1, MAX_CF_RETRIES + 1):
         if _tunnel_found.is_set():
@@ -134,11 +114,11 @@ def cloudflared_loop() -> None:
                 return
 
             exit_code = proc.returncode
-            print(f"[cloudflared] ✗ Exited (code {exit_code}) without a tunnel URL")
+            print(f"[cloudflared] :: Exited (code {exit_code}) without a tunnel URL")
             _procs.remove(proc)
 
         except FileNotFoundError:
-            print("[cloudflared] ✗ 'cloudflared' binary not found in PATH.")
+            print("[cloudflared] :: 'cloudflared' binary not found in PATH.")
             print("   Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/")
             return
 
@@ -146,9 +126,7 @@ def cloudflared_loop() -> None:
             print(f"[cloudflared] Retrying in {CF_RETRY_DELAY} s...")
             time.sleep(CF_RETRY_DELAY)
 
-    print("[cloudflared] ✗ Exhausted all retries — tunnel not established.")
-
-# ── Signal handler ────────────────────────────────────────────────────────────
+    print("[cloudflared] :: Exhausted all retries — tunnel not established.")
 
 def shutdown(signum, frame):
     print("\n[LAUNCHER] Shutting down...")
@@ -158,8 +136,6 @@ def shutdown(signum, frame):
         except Exception:
             pass
     sys.exit(0)
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     signal.signal(signal.SIGINT,  shutdown)

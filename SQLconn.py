@@ -12,6 +12,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Method to get the connection from database
 def get_db():
     db = SessionLocal()
     try:
