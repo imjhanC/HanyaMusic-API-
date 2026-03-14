@@ -55,6 +55,7 @@ class ITunes:
         # Sort albums newest-first
         albums.sort(key=lambda x: x.get("releaseDate", ""), reverse=True)
 
+        seen_albums = set()
         deduplicated_albums = []
         for album in albums:
             name_key = album.get("collectionName", "").lower().strip()
