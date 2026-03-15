@@ -116,7 +116,7 @@ class ITunes:
         Deduplicates songs by title to ensure unique results across albums.
         """
         all_songs = self.get_all_official_songs_by_artist(artist_name)
-        
+        top_10_songs = self.get_top_songs_by_artist(artist_name, 10)
         if not all_songs:
             return {
                 "artist": artist_name,
@@ -170,7 +170,8 @@ class ITunes:
             "total_songs": len(unique_all_songs),
             "total_albums": len(albums_dict),
             "albums": albums_dict,
-            "sample_thumbnails": sample_thumbnails
+            "sample_thumbnails": sample_thumbnails,
+            "top_10_songs": top_10_songs
         }
     
     def get_top_global_artists(self, limit: int = 100) -> List[Dict]:
@@ -440,3 +441,33 @@ class ITunes:
                 break
 
         return ranked_artists
+    
+    # Get Top 10 songs by an artists
+    def get_top_songs_by_artist(self, artist_name: str, limit: int = 10) -> List[Dict]:
+        """Fetch top songs for an artist from iTunes search."""
+        params = {
+            "term": artist_name,
+            "media": "music",
+            "entity": "song",
+            "attribute": "artistTerm",
+            "limit": limit,
+            "country": self.country
+        }
+
+        data = self._get("search", params)
+
+        songs = []
+        for r in data.get("results", []):
+            thumbnail = r.get("artworkUrl100")
+            if thumbnail:
+                thumbnail = thumbnail.replace("100x100bb", "600x600bb")
+
+            songs.append({
+                "song_name": r.get("trackName"),
+                "album_name": r.get("collectionName"),
+                "preview_url": r.get("previewUrl"),
+                "release_date": r.get("releaseDate"),
+                "thumbnail": thumbnail
+            })
+
+        return songs
