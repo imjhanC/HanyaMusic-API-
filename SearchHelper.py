@@ -484,7 +484,7 @@ class SearchHelper:
             ),
             'merge_output_format': 'mp4',
             'outtmpl': outtmpl + '.%(ext)s',
-            'concurrent_fragment_downloads': 128,
+            'concurrent_fragment_downloads': 512,
             'retries': 5,
             'fragment_retries': 5,
             'noplaylist': True,

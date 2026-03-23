@@ -420,8 +420,8 @@ class ITunes:
             "term": song,
             "media": "music",
             "entity": "song",
-            "attribute": "songTerm",   
-            "limit": 20                
+            "attribute": "songTerm",
+            "limit": 20
         }
 
         r = requests.get(url, params=params, timeout=5)
@@ -431,17 +431,21 @@ class ITunes:
         seen = set()
 
         for item in data["results"]:
-            artist = item["artistName"]
+            artist = item.get("artistName")
+            genre = item.get("primaryGenreName")
 
             if artist not in seen:
-                ranked_artists.append(artist)
+                ranked_artists.append({
+                    "artist": artist,
+                    "genre": genre
+                })
                 seen.add(artist)
 
             if len(ranked_artists) == 5:
                 break
 
         return ranked_artists
-    
+
     # Get Top 10 songs by an artists
     def get_top_songs_by_artist(self, artist_name: str, limit: int = 10) -> List[Dict]:
         """Fetch top songs for an artist from iTunes search."""

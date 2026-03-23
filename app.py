@@ -1169,9 +1169,19 @@ async def get_related_artists(request: Request, song_name: str):
         if not related_artists:
             return {"song": song_name, "related_artists": []}
 
-        async def fetch_artist_data(artist_name):
-            image = await loop.run_in_executor(None, lastfm_client.get_artist_image, artist_name)
-            return {"artist_name": artist_name, "image": image}
+        async def fetch_artist_data(artist_obj):
+            artist_name = artist_obj["artist"]
+            genre = artist_obj["genre"]
+
+            image = await loop.run_in_executor(
+                None, lastfm_client.get_artist_image, artist_name
+            )
+
+            return {
+                "artist_name": artist_name,
+                "genre": genre,
+                "image": image
+            }
 
         results = await asyncio.gather(*[fetch_artist_data(a) for a in related_artists])
         return {"song": song_name, "related_artists": results}
@@ -1179,7 +1189,6 @@ async def get_related_artists(request: Request, song_name: str):
     except Exception as e:
         print(f"[RELATED-ARTISTS] Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch related artists")
-
 
 @app.get("/topglobalartists")
 def top_global_artists(request: Request, limit: int = 100):
