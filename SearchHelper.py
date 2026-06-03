@@ -16,6 +16,15 @@ from fastapi import HTTPException
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.path.join(_BASE_DIR, 'cookies.txt')
 
+# Deno path configuration for yt-dlp JS challenges solver
+_DENO_PATH = os.path.join(_BASE_DIR, 'venv', 'lib64', 'python3.12', 'site-packages', 'deno.exe')
+if not os.path.exists(_DENO_PATH):
+    _DENO_PATH = os.path.join(_BASE_DIR, 'venv', 'lib', 'python3.12', 'site-packages', 'deno.exe')
+
+# Inject nodejs into PATH so yt-dlp can use it for JS challenges
+_VENV_BIN = os.path.join(_BASE_DIR, 'venv', 'bin')
+if _VENV_BIN not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"{_VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
 
 class SearchHelper:
     @staticmethod
@@ -102,6 +111,10 @@ class SearchHelper:
                 'http_headers': cls.get_common_headers(),
                 'nocheckcertificate': True,
                 'no_color': True,
+                'js_runtimes': {
+                    'deno': {'path': _DENO_PATH},
+                    'node': {},
+                },
                 'extractor_args': {
                     'youtube': {'skip': ['hls', 'dash', 'translated_subs']}
                 },
@@ -163,6 +176,10 @@ class SearchHelper:
             'http_headers': cls.get_common_headers(),
             'nocheckcertificate': True,
             'no_color': True,
+            'js_runtimes': {
+                'deno': {'path': _DENO_PATH},
+                'node': {},
+            },
             **cls._get_cookie_opts(),
         }
 
@@ -245,6 +262,10 @@ class SearchHelper:
                 'http_headers': cls.get_common_headers(),
                 'nocheckcertificate': True,
                 'no_color': True,
+                'js_runtimes': {
+                    'deno': {'path': _DENO_PATH},
+                    'node': {},
+                },
                 **cls._get_cookie_opts(),
             }
 
@@ -400,6 +421,10 @@ class SearchHelper:
                 'http_headers': cls.get_common_headers(),
                 'nocheckcertificate': True,
                 'no_color': True,
+                'js_runtimes': {
+                    'deno': {'path': _DENO_PATH},
+                    'node': {},
+                },
                 **cls._get_cookie_opts(),
             }
 
@@ -493,6 +518,10 @@ class SearchHelper:
             'nocheckcertificate': True,
             'socket_timeout': 20,
             'http_headers': cls.get_common_headers(),
+            'js_runtimes': {
+                'deno': {'path': _DENO_PATH},
+                'node': {},
+            },
             'postprocessor_args': {
                 'ffmpeg': ['-movflags', '+faststart']
             },
@@ -533,6 +562,10 @@ class SearchHelper:
                 'http_headers': cls.get_common_headers(),
                 'nocheckcertificate': True,
                 'no_color': True,
+                'js_runtimes': {
+                    'deno': {'path': _DENO_PATH},
+                    'node': {},
+                },
                 'extractor_args': {
                     'youtube': {'skip': ['hls', 'dash', 'translated_subs']}
                 },

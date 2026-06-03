@@ -19,10 +19,10 @@ from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import create_engine, text
 import os
 from dotenv import load_dotenv
-load_dotenv() ##Load the env file
+load_dotenv() ## Load the env file
 import base64
 
-# Importing other classes
+# Classes 
 from AdvancedCache import AdvancedCache
 from RedisCache import RedisCache
 from RequestDeduplicator import RequestDeduplicator
@@ -215,7 +215,7 @@ async def run_yt_dlp_update():
     print("[YT-DLP] Running yt-dlp update...")
     try:
         result = subprocess.run(
-            ["python", "-m", "pip", "install", "-U", "yt-dlp"],
+            ["python", "-m", "pip", "install", "-U", "https://github.com/yt-dlp/yt-dlp/archive/master.zip"],
             check=True, capture_output=True, text=True
         )
         print("[YT-DLP] Update completed successfully.")
