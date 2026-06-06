@@ -3,9 +3,12 @@ from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import random
+from dotenv import load_dotenv
+import os 
+load_dotenv() # Load from env file 
 
 class ITunes:
-    BASE_URL = "https://itunes.apple.com"
+    BASE_URL = os.getenv("ITUNES_BASE_URL")
 
     def __init__(self, country: str = "US", timeout: int = 10):
         self.country = country
