@@ -7,6 +7,7 @@ from typing import Optional
 from jose import JWTError, jwt
 import bcrypt as bcrypt_lib
 import base64
+import secrets  # <-- ADDED for refresh tokens
 
 from SQLconn import get_db
 from pydantic import BaseModel
@@ -31,16 +32,21 @@ class UserResponse(BaseModel):
 
 class Token(BaseModel):
     access_token: str
+    refresh_token: str  # <-- ADDED
     token_type: str
 
 class TokenData(BaseModel):
     username: Optional[str] = None
+
+class RefreshTokenRequest(BaseModel): # <-- ADDED
+    refresh_token: str
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SECRET_KEY = "HANYAMUSIC_SECRET_KEY_PLEASE_CHANGE_IN_PRODUCTION"  # TODO: Move to .env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30 # <-- ADDED
 
 # ─── Password Helpers ────────────────────────────────────────────────────────
 
@@ -56,13 +62,16 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 # ─── JWT Helpers ─────────────────────────────────────────────────────────────
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token") # Make sure tokenUrl matches the route prefix
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token() -> str: # <-- ADDED
+    return secrets.token_urlsafe(32)
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
@@ -125,6 +134,7 @@ async def register(
         avatar_url_value = f"data:{avatar.content_type};base64,{encoded_string}"
 
     try:
+        # 1. Insert User
         query = text("""
             INSERT INTO users (username, email, password_hash, display_name, avatar_url)
             VALUES (:username, :email, :password_hash, :display_name, :avatar_url)
@@ -138,12 +148,25 @@ async def register(
             "avatar_url": avatar_url_value
         })
         new_user = result.fetchone()
-        db.commit()
-
+        
+        # 2. Generate Tokens
         access_token = create_access_token(
             data={"sub": new_user.username},
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         )
+        refresh_token = create_refresh_token()
+        expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+        # 3. Store Refresh Token
+        db.execute(
+            text("""
+                INSERT INTO user_sessions (user_id, refresh_token, expires_at)
+                VALUES (:user_id, :refresh_token, :expires_at)
+            """),
+            {"user_id": new_user.id, "refresh_token": refresh_token, "expires_at": expires_at}
+        )
+        db.commit()
+
         return {
             "id": new_user.id,
             "username": new_user.username,
@@ -151,6 +174,7 @@ async def register(
             "created_at": new_user.created_at,
             "message": "User registered successfully",
             "access_token": access_token,
+            "refresh_token": refresh_token, # Now returns refresh token too!
             "token_type": "bearer"
         }
     except Exception as e:
@@ -174,11 +198,81 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # 1. Create short-lived Access Token
     access_token = create_access_token(
         data={"sub": user.username},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    # 2. Create long-lived Refresh Token
+    refresh_token = create_refresh_token()
+    expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+    # 3. Store the session in the database
+    db.execute(
+        text("""
+            INSERT INTO user_sessions (user_id, refresh_token, expires_at)
+            VALUES (:user_id, :refresh_token, :expires_at)
+        """),
+        {"user_id": user.id, "refresh_token": refresh_token, "expires_at": expires_at}
+    )
+    db.commit()
+
+    return {
+        "access_token": access_token, 
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+@router.post("/refresh-token")
+async def refresh_token(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+    # 1. Verify the refresh token exists, isn't revoked, and isn't expired
+    session = db.execute(
+        text("""
+            SELECT user_sessions.*, users.username 
+            FROM user_sessions 
+            JOIN users ON user_sessions.user_id = users.id
+            WHERE refresh_token = :refresh_token AND revoked = FALSE AND expires_at > NOW()
+        """),
+        {"refresh_token": request.refresh_token}
+    ).fetchone()
+
+    if not session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+
+    # 2. Issue a fresh access token
+    new_access_token = create_access_token(
+        data={"sub": session.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    # 3. ROLLING SESSION: Push the expiration date back another 30 days
+    new_expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    db.execute(
+        text("""
+            UPDATE user_sessions 
+            SET expires_at = :new_expires_at 
+            WHERE refresh_token = :refresh_token
+        """),
+        {"new_expires_at": new_expires_at, "refresh_token": request.refresh_token}
+    )
+    db.commit()
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": request.refresh_token, 
+        "token_type": "bearer"
+    }
+
+@router.post("/logout")
+async def logout(request: RefreshTokenRequest, db: Session = Depends(get_db)):
+    # 1. Mark the specific refresh token as revoked
+    db.execute(
+        text("UPDATE user_sessions SET revoked = TRUE WHERE refresh_token = :refresh_token"),
+        {"refresh_token": request.refresh_token}
+    )
+    db.commit()
+    return {"message": "Successfully logged out"}
 
 @router.get("/users/me", response_model=UserResponse)
 async def read_users_me(current_user = Depends(get_current_user)):
