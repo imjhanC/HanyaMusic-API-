@@ -8,23 +8,20 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import yt_dlp
 from fastapi import HTTPException
 
-# Resolve cookies.txt path relative to this file
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COOKIES_FILE = os.path.join(_BASE_DIR, 'cookies.txt')
+COOKIES_FILE = os.path.join(_BASE_DIR, 'cookies.txt')  # Get the authenticated cookies.txt file path
 
-# Deno path configuration for yt-dlp JS challenges solver
+# Deno path configuration for yt-dlp JS challenges solver ( Security bypass )
 _DENO_PATH = os.path.join(_BASE_DIR, 'venv', 'lib64', 'python3.12', 'site-packages', 'deno.exe')
 if not os.path.exists(_DENO_PATH):
     _DENO_PATH = os.path.join(_BASE_DIR, 'venv', 'lib', 'python3.12', 'site-packages', 'deno.exe')
-
-# Inject nodejs into PATH so yt-dlp can use it for JS challenges
 _VENV_BIN = os.path.join(_BASE_DIR, 'venv', 'bin')
 if _VENV_BIN not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{_VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}"
+
 
 class SearchHelper:
     @staticmethod
@@ -329,6 +326,7 @@ class SearchHelper:
             '-reconnect_delay_max', '3',
         ]
 
+    # Merge video ( No sound ) with the audio using FFMPEG
     @staticmethod
     def merge_video_audio_ffmpeg_stream(video_url: str, audio_url: str) -> subprocess.Popen:
         """
@@ -383,7 +381,7 @@ class SearchHelper:
             raise RuntimeError(
                 f"ffmpeg failed (code {result.returncode}): {result.stderr.strip()}"
             )
-        print(f"[FFmpeg-DISK] ✓ Done → {output_path} ({os.path.getsize(output_path):,} bytes)")
+        print(f"[FFmpeg-DISK] Done → {output_path} ({os.path.getsize(output_path):,} bytes)")
 
     @classmethod
     def merge_video_audio_ffmpeg(cls, video_url: str, audio_url: str, output_dir: str) -> str:
