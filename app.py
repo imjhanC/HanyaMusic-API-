@@ -24,6 +24,7 @@ import base64
 
 # Import from SQLAuth
 from SQLAuth import router as auth_router, get_current_user
+from SQLPlaylist import router as playlists_router
 
 # Classes 
 from AdvancedCache import AdvancedCache
@@ -57,6 +58,8 @@ app.add_middleware(
 
 # Include auth router
 app.include_router(auth_router)
+# Include playlists router
+app.include_router(playlists_router)
 
 # Pydantic Models for music endpoints
 class SearchResult(BaseModel):
