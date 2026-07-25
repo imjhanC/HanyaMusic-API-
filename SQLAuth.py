@@ -8,6 +8,7 @@ from jose import JWTError, jwt
 import bcrypt as bcrypt_lib
 import base64
 import secrets  # <-- ADDED for refresh tokens
+from RedisCache import RedisCache
 
 from SQLconn import get_db
 from pydantic import BaseModel
@@ -70,6 +71,32 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+
+
+auth_cache = RedisCache(prefix="hanya:auth:")
+
+class CachedUser:
+    def __init__(self, data: dict):
+        self._data = data
+        for k, v in data.items():
+            if isinstance(v, str) and (k.endswith('_at') or k == 'last_login'):
+                try:
+                    # Parse standard ISO format strings
+                    v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            setattr(self, k, v)
+
+    @property
+    def _mapping(self):
+        return self._data
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def keys(self):
+        return self._data.keys()
+
 def create_refresh_token() -> str: # <-- ADDED
     return secrets.token_urlsafe(32)
 
@@ -88,12 +115,29 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     except JWTError:
         raise credentials_exception
 
+    # Try fetching from Redis cache first
+    cached = auth_cache.get(f"user:{token_data.username}")
+    if cached:
+        return CachedUser(cached)
+
     user = db.execute(
-        text("SELECT * FROM users WHERE username = :username"),
+        text("SELECT id, username, email, display_name, avatar_url, is_verified, is_active, role, last_login, created_at, updated_at FROM users WHERE username = :username"),
         {"username": token_data.username}
     ).fetchone()
     if user is None:
         raise credentials_exception
+
+    # Cache user details
+    try:
+        user_dict = dict(user._mapping)
+        # Convert datetime objects to string format for JSON serialization
+        for k, v in user_dict.items():
+            if isinstance(v, datetime):
+                user_dict[k] = v.isoformat()
+        auth_cache.set(f"user:{token_data.username}", user_dict, ttl_minutes=10)
+    except Exception as e:
+        print(f"[AUTH_CACHE] Failed to cache user: {e}")
+
     return user
 
 # ─── Router Setup ────────────────────────────────────────────────────────────

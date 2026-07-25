@@ -225,21 +225,7 @@ async def update_playlist(
     db: Session = Depends(get_db)
 ):
     """Update a playlist's metadata. Only the owner can update."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
-    new_name        = name        if name        is not None else playlist.name
-    new_description = description if description is not None else playlist.description
-    new_is_public   = is_public   if is_public   is not None else playlist.is_public
-    new_image_url   = playlist.image_url
-
+    new_image_url = None
     if image:
         if image.content_type not in ["image/jpeg", "image/png", "image/gif", "image/jpg", "image/webp"]:
             raise HTTPException(status_code=400, detail="Invalid image format")
@@ -251,23 +237,41 @@ async def update_playlist(
         result = db.execute(
             text("""
                 UPDATE playlists
-                SET name = :name, description = :description,
-                    is_public = :is_public, image_url = :image_url,
+                SET name = COALESCE(:name, name),
+                    description = COALESCE(:description, description),
+                    is_public = COALESCE(:is_public, is_public),
+                    image_url = COALESCE(:image_url, image_url),
                     updated_at = NOW()
-                WHERE id = :playlist_id
+                WHERE id = :playlist_id AND user_id = :user_id
                 RETURNING *
             """),
             {
-                "name": new_name,
-                "description": new_description,
-                "is_public": new_is_public,
+                "name": name,
+                "description": description,
+                "is_public": is_public,
                 "image_url": new_image_url,
                 "playlist_id": playlist_id,
+                "user_id": current_user.id,
             }
         )
         updated = result.fetchone()
+
+        if not updated:
+            # Check why it failed (fallback for detailed error message)
+            playlist = db.execute(
+                text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+                {"playlist_id": playlist_id}
+            ).fetchone()
+            if not playlist:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            if playlist.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="You do not own this playlist")
+
         db.commit()
         return updated
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update playlist: {str(e)}")
@@ -280,22 +284,28 @@ def delete_playlist(
     db: Session = Depends(get_db)
 ):
     """Delete a playlist and all its tracks (cascade). Only the owner can delete."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
     try:
-        db.execute(
-            text("DELETE FROM playlists WHERE id = :playlist_id"),
-            {"playlist_id": playlist_id}
+        result = db.execute(
+            text("DELETE FROM playlists WHERE id = :playlist_id AND user_id = :user_id RETURNING id"),
+            {"playlist_id": playlist_id, "user_id": current_user.id}
         )
+        deleted = result.fetchone()
+
+        if not deleted:
+            # Check why it failed
+            playlist = db.execute(
+                text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+                {"playlist_id": playlist_id}
+            ).fetchone()
+            if not playlist:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            if playlist.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="You do not own this playlist")
+
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete playlist: {str(e)}")
@@ -311,32 +321,15 @@ def add_track(
     db: Session = Depends(get_db)
 ):
     """Add a track to a playlist. Only the owner can add tracks."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
-    # Auto-assign track_order to the end if not provided
-    track_order = track.track_order
-    if track_order is None:
-        row = db.execute(
-            text("SELECT COALESCE(MAX(track_order), 0) + 1 AS next_order FROM playlist_tracks WHERE playlist_id = :playlist_id"),
-            {"playlist_id": playlist_id}
-        ).fetchone()
-        track_order = row.next_order
-
     try:
         result = db.execute(
             text("""
-                INSERT INTO playlist_tracks
-                    (playlist_id, video_id, title, artist, image_url, duration_seconds, track_order)
-                VALUES
-                    (:playlist_id, :video_id, :title, :artist, :image_url, :duration_seconds, :track_order)
+                INSERT INTO playlist_tracks (playlist_id, video_id, title, artist, image_url, duration_seconds, track_order)
+                SELECT :playlist_id, :video_id, :title, :artist, :image_url, :duration_seconds,
+                       COALESCE(:track_order, (SELECT COALESCE(MAX(track_order), 0) + 1 FROM playlist_tracks WHERE playlist_id = :playlist_id))
+                WHERE EXISTS (
+                    SELECT 1 FROM playlists WHERE id = :playlist_id AND user_id = :user_id
+                )
                 RETURNING *
             """),
             {
@@ -346,12 +339,28 @@ def add_track(
                 "artist": track.artist,
                 "image_url": track.image_url,
                 "duration_seconds": track.duration_seconds,
-                "track_order": track_order,
+                "track_order": track.track_order,
+                "user_id": current_user.id,
             }
         )
         new_track = result.fetchone()
+
+        if not new_track:
+            # Fallback error check
+            playlist = db.execute(
+                text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+                {"playlist_id": playlist_id}
+            ).fetchone()
+            if not playlist:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            if playlist.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="You do not own this playlist")
+
         db.commit()
         return new_track
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         if "unique" in str(e).lower():
@@ -366,24 +375,26 @@ def get_tracks(
     db: Session = Depends(get_db)
 ):
     """Get all tracks in a playlist, ordered by track_order."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if not playlist.is_public and playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied to this private playlist")
-
-    tracks = db.execute(
+    rows = db.execute(
         text("""
-            SELECT * FROM playlist_tracks
-            WHERE playlist_id = :playlist_id
-            ORDER BY track_order ASC, added_at ASC
+            SELECT pt.*, p.user_id AS playlist_owner_id, p.is_public AS playlist_is_public
+            FROM playlists p
+            LEFT JOIN playlist_tracks pt ON p.id = pt.playlist_id
+            WHERE p.id = :playlist_id
+            ORDER BY pt.track_order ASC, pt.added_at ASC
         """),
         {"playlist_id": playlist_id}
     ).fetchall()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    first_row = rows[0]
+    if not first_row.playlist_is_public and first_row.playlist_owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied to this private playlist")
+
+    # If playlist has no tracks, left join yields None values for all pt.* columns
+    tracks = [r for r in rows if r.id is not None]
     return tracks
 
 
@@ -396,41 +407,54 @@ def update_track(
     db: Session = Depends(get_db)
 ):
     """Update a track's metadata (order, title, artist). Only the playlist owner can update."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
-    track = db.execute(
-        text("SELECT * FROM playlist_tracks WHERE id = :track_id AND playlist_id = :playlist_id"),
-        {"track_id": track_id, "playlist_id": playlist_id}
-    ).fetchone()
-
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found in this playlist")
-
-    new_order  = body.track_order if body.track_order is not None else track.track_order
-    new_title  = body.title       if body.title       is not None else track.title
-    new_artist = body.artist      if body.artist      is not None else track.artist
-
     try:
         result = db.execute(
             text("""
-                UPDATE playlist_tracks
-                SET track_order = :track_order, title = :title, artist = :artist
-                WHERE id = :track_id
-                RETURNING *
+                UPDATE playlist_tracks pt
+                SET track_order = COALESCE(:track_order, pt.track_order),
+                    title = COALESCE(:title, pt.title),
+                    artist = COALESCE(:artist, pt.artist)
+                FROM playlists p
+                WHERE pt.playlist_id = p.id
+                  AND pt.id = :track_id
+                  AND pt.playlist_id = :playlist_id
+                  AND p.user_id = :user_id
+                RETURNING pt.*
             """),
-            {"track_order": new_order, "title": new_title, "artist": new_artist, "track_id": track_id}
+            {
+                "track_order": body.track_order,
+                "title": body.title,
+                "artist": body.artist,
+                "track_id": track_id,
+                "playlist_id": playlist_id,
+                "user_id": current_user.id
+            }
         )
         updated = result.fetchone()
+
+        if not updated:
+            # Fallback error check
+            playlist = db.execute(
+                text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+                {"playlist_id": playlist_id}
+            ).fetchone()
+            if not playlist:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            if playlist.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="You do not own this playlist")
+
+            track = db.execute(
+                text("SELECT id FROM playlist_tracks WHERE id = :track_id AND playlist_id = :playlist_id"),
+                {"track_id": track_id, "playlist_id": playlist_id}
+            ).fetchone()
+            if not track:
+                raise HTTPException(status_code=404, detail="Track not found in this playlist")
+
         db.commit()
         return updated
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to update track: {str(e)}")
@@ -444,30 +468,47 @@ def remove_track(
     db: Session = Depends(get_db)
 ):
     """Remove a track from a playlist. Only the playlist owner can remove tracks."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
-    track = db.execute(
-        text("SELECT id FROM playlist_tracks WHERE id = :track_id AND playlist_id = :playlist_id"),
-        {"track_id": track_id, "playlist_id": playlist_id}
-    ).fetchone()
-
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found in this playlist")
-
     try:
-        db.execute(
-            text("DELETE FROM playlist_tracks WHERE id = :track_id"),
-            {"track_id": track_id}
+        result = db.execute(
+            text("""
+                DELETE FROM playlist_tracks pt
+                USING playlists p
+                WHERE pt.playlist_id = p.id
+                  AND pt.id = :track_id
+                  AND pt.playlist_id = :playlist_id
+                  AND p.user_id = :user_id
+                RETURNING pt.id;
+            """),
+            {
+                "track_id": track_id,
+                "playlist_id": playlist_id,
+                "user_id": current_user.id
+            }
         )
+        deleted = result.fetchone()
+
+        if not deleted:
+            # Fallback error check
+            playlist = db.execute(
+                text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+                {"playlist_id": playlist_id}
+            ).fetchone()
+            if not playlist:
+                raise HTTPException(status_code=404, detail="Playlist not found")
+            if playlist.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="You do not own this playlist")
+
+            track = db.execute(
+                text("SELECT id FROM playlist_tracks WHERE id = :track_id AND playlist_id = :playlist_id"),
+                {"track_id": track_id, "playlist_id": playlist_id}
+            ).fetchone()
+            if not track:
+                raise HTTPException(status_code=404, detail="Track not found in this playlist")
+
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to remove track: {str(e)}")
@@ -480,22 +521,36 @@ def clear_playlist(
     db: Session = Depends(get_db)
 ):
     """Remove ALL tracks from a playlist without deleting the playlist itself."""
-    playlist = db.execute(
-        text("SELECT * FROM playlists WHERE id = :playlist_id"),
-        {"playlist_id": playlist_id}
-    ).fetchone()
-
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You do not own this playlist")
-
     try:
-        db.execute(
-            text("DELETE FROM playlist_tracks WHERE playlist_id = :playlist_id"),
-            {"playlist_id": playlist_id}
+        # Single-trip conditional delete
+        result = db.execute(
+            text("""
+                DELETE FROM playlist_tracks pt
+                USING playlists p
+                WHERE pt.playlist_id = p.id
+                  AND pt.playlist_id = :playlist_id
+                  AND p.user_id = :user_id
+                RETURNING pt.id;
+            """),
+            {"playlist_id": playlist_id, "user_id": current_user.id}
         )
+        deleted = result.fetchall()
+
+        # Check ownership and existence (since clearing an already empty playlist is not an error)
+        playlist = db.execute(
+            text("SELECT id, user_id FROM playlists WHERE id = :playlist_id"),
+            {"playlist_id": playlist_id}
+        ).fetchone()
+
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        if playlist.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You do not own this playlist")
+
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to clear playlist: {str(e)}")
